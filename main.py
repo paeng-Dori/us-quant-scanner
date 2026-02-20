@@ -33,20 +33,25 @@ def get_optimal_atr_mult(df):
     return np.percentile(mae_list, 90) if mae_list else 2.5
 
 def analyze():
-    # 1. 종목 리스트 수집
+    # 1. 종목 리스트 수집 (위키피디아)
+    tickers = []
     try:
-        header = {"User-Agent": "Mozilla/5.0"}
-        sp500 = pd.read_html(requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=header).text)[0]['Symbol'].tolist()
-        nasdaq100 = pd.read_html(requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=header).text)[0]['Symbol'].tolist()
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        sp500_res = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=15)
+        sp500 = pd.read_html(sp500_res.text)[0]['Symbol'].tolist()
+        nas100_res = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers, timeout=15)
+        nasdaq100 = pd.read_html(nas100_res.text)[0]['Symbol'].tolist()
         tickers = list(set(sp500 + nasdaq100))
         tickers = [t.replace('.', '-') for t in tickers]
-    except:
-        tickers = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "META"]
+    except Exception as e:
+        # 비상용 리스트 대신 실패 알림 후 종료
+        send_telegram(f"⚠️ <b>데이터 수집 실패 알림</b>\n위키피디아 지수 종목 리스트를 가져오지 못했습니다.\n(사유: {str(e)})")
+        return # 함수 강제 종료
 
     total_scan = len(tickers)
-    step1_pass = 0 # 가격/유동성 통과
-    step2_pass = 0 # RSI/거래량 통과
-    final_pass = 0 # 최종 매수조건 통과
+    step1_pass = 0 # 가격/유동성
+    step2_pass = 0 # RSI/거래량
+    final_pass = 0 # 최종
 
     msg_list = []
     
@@ -62,6 +67,7 @@ def analyze():
             turnover = curr_price * avg_vol_20
             
             # --- [STEP 1: 가격 및 유동성 필터] ---
+            # 10 <= Price <= 300 & Turnover > 20M
             if not (10 <= curr_price <= 300) or turnover < 20000000: continue
             step1_pass += 1
             
@@ -102,11 +108,9 @@ def analyze():
                 )
         except: continue
 
-    # 최종 메시지 조립
+    # 메시지 조립
     header = f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n\n"
     body = "\n".join(msg_list) if final_pass > 0 else "❌ <b>오늘은 조건에 맞는 눌림목 종목이 없습니다.</b>\n"
-    
-    # [요청하신 진단 결과 섹션]
     footer = (f"\n<b>[진단 결과]</b>\n"
               f"* 총 스캔 종목: {total_scan}개\n"
               f"* 가격/유동성 통과: {step1_pass}개\n"
