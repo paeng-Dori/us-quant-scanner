@@ -5,13 +5,12 @@ import numpy as np
 import requests
 import os
 import time
+import tempfile
 from datetime import datetime
 
 # --- [1. 자산 및 리스크 설정] ---
 BOT_TOKEN = os.environ.get('TG_TOKEN')
 CHAT_ID = os.environ.get('TG_CHAT_ID')
-TOTAL_CAPITAL = 10000
-RISK_PER_TRADE = 0.02 # 2% 리스크 ($200)
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID: return
@@ -33,43 +32,56 @@ def get_optimal_atr_mult(df):
         if drawdown > 0: mae_list.append(drawdown / entry_atr)
     return np.percentile(mae_list, 90) if mae_list else 2.5
 
-def analyze():
-    # 1. 종목 리스트 수집 (재시도 로직 포함)
-    tickers = []
-    max_retries = 3  # 최대 3번 시도
-    retry_delay = 10 # 실패 시 10초 대기
+# Pandas Errno 2 버그 원천 차단을 위한 안전 추출 함수
+def fetch_wiki_tickers_safe(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+    res = requests.get(url, headers=headers, timeout=15)
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    # 가상의 물리적 임시 파일 생성
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+        f.write(res.text)
+        tmp_path = f.name
+        
+    try:
+        # 파일 경로를 직접 넘겨주어 경로 오인 버그 차단
+        tables = pd.read_html(tmp_path)
+        for df in tables:
+            # 위키피디아 테이블 구조 변동에 대비해 Symbol과 Ticker 모두 검사
+            if 'Symbol' in df.columns: return df['Symbol'].tolist()
+            if 'Ticker' in df.columns: return df['Ticker'].tolist()
+    finally:
+        os.remove(tmp_path) # 사용 완료 후 임시 파일 삭제
+    return []
 
+def analyze():
+    tickers = []
+    max_retries = 3
+    retry_delay = 10
+
+    # 1. 종목 리스트 수집
     for attempt in range(1, max_retries + 1):
         try:
             print(f"🚀 종목 리스트 수집 시도 ({attempt}/{max_retries})...")
-            sp500_res = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=15)
-            sp500 = pd.read_html(sp500_res.text)[0]['Symbol'].tolist()
             
-            nas100_res = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers, timeout=15)
-            nasdaq100 = pd.read_html(nas100_res.text)[0]['Symbol'].tolist()
+            sp500 = fetch_wiki_tickers_safe('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+            nasdaq100 = fetch_wiki_tickers_safe('https://en.wikipedia.org/wiki/Nasdaq-100')
             
             tickers = list(set(sp500 + nasdaq100))
             tickers = [t.replace('.', '-') for t in tickers]
             
-            if len(tickers) > 400: # 정상적으로 수집된 경우
-                print(f"✅ {len(tickers)}개 종목 수집 성공!")
+            if len(tickers) > 400:
+                print(f"✅ {len(tickers)}개 종목 명단 확보 성공!")
                 break
         except Exception as e:
-            print(f"⚠️ {attempt}차 수집 실패: {e}")
+            print(f"⚠️ {attempt}차 수집 실패 사유: {e}")
             if attempt < max_retries:
                 time.sleep(retry_delay)
             else:
-                # 3번 모두 실패했을 때만 알림 전송
-                send_telegram(f"⚠️ <b>데이터 수집 최종 실패</b>\n3회 시도했으나 지수 종목 리스트를 가져오지 못했습니다.\n(사유: {str(e)})")
+                send_telegram(f"⚠️ <b>데이터 수집 최종 실패</b>\n위키피디아 접속 또는 파싱에 실패했습니다.\n(사유: {str(e)})")
                 return
 
     total_scan = len(tickers)
-    step1_pass = 0
-    step2_pass = 0
-    final_pass = 0
-
+    step1_pass, step2_pass, final_pass = 0, 0, 0
     msg_list = []
     
     for ticker in tickers:
@@ -83,25 +95,19 @@ def analyze():
             avg_vol_20 = float(df['Volume'].rolling(20).mean().iloc[-1])
             turnover = curr_price * avg_vol_20
             
-            # --- [STEP 1: 가격/유동성] ---
             if not (10 <= curr_price <= 300) or turnover < 20000000: continue
             step1_pass += 1
             
-            # 지표 계산
-            df['MA20'] = ta.sma(df['Close'], 20)
-            df['MA50'] = ta.sma(df['Close'], 50)
+            df['MA20'], df['MA50'] = ta.sma(df['Close'], 20), ta.sma(df['Close'], 50)
             adx_df = ta.adx(df['High'], df['Low'], df['Close'], 14)
             df['ADX'], df['PDI'], df['MDI'] = adx_df['ADX_14'], adx_df['DMP_14'], adx_df['DMN_14']
-            bb = ta.bbands(df['Close'], 20, 2.0)
-            df['BB_MID'] = bb['BBM_20_2.0']
+            df['BB_MID'] = ta.bbands(df['Close'], 20, 2.0)['BBM_20_2.0']
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
             rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
 
-            # --- [STEP 2: RSI/거래량] ---
             if curr_vol >= (avg_vol_20 * 0.8) or rsi_val <= 35: continue
             step2_pass += 1
 
-            # --- [STEP 3: 기술적 조건] ---
             c1 = df['MA20'].iloc[-1] > df['MA50'].iloc[-1]
             c2 = (df['ADX'].iloc[-1] >= 20) and (df['ADX'].iloc[-1] >= df['ADX'].iloc[-2]) and (df['PDI'].iloc[-1] > df['MDI'].iloc[-1])
             c3 = (df['Close'].iloc[-1] <= df['BB_MID'].iloc[-1])
@@ -124,7 +130,6 @@ def analyze():
                 )
         except: continue
 
-    # 메시지 조립
     header = f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n\n"
     body = "\n".join(msg_list) if final_pass > 0 else "❌ <b>오늘은 조건에 맞는 눌림목 종목이 없습니다.</b>\n"
     footer = (f"\n<b>[진단 결과]</b>\n"
