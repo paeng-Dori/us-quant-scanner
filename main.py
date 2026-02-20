@@ -4,6 +4,7 @@ import pandas_ta as ta
 import numpy as np
 import requests
 import os
+import time
 from datetime import datetime
 
 # --- [1. 자산 및 리스크 설정] ---
@@ -33,25 +34,41 @@ def get_optimal_atr_mult(df):
     return np.percentile(mae_list, 90) if mae_list else 2.5
 
 def analyze():
-    # 1. 종목 리스트 수집 (위키피디아)
+    # 1. 종목 리스트 수집 (재시도 로직 포함)
     tickers = []
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        sp500_res = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=15)
-        sp500 = pd.read_html(sp500_res.text)[0]['Symbol'].tolist()
-        nas100_res = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers, timeout=15)
-        nasdaq100 = pd.read_html(nas100_res.text)[0]['Symbol'].tolist()
-        tickers = list(set(sp500 + nasdaq100))
-        tickers = [t.replace('.', '-') for t in tickers]
-    except Exception as e:
-        # 비상용 리스트 대신 실패 알림 후 종료
-        send_telegram(f"⚠️ <b>데이터 수집 실패 알림</b>\n위키피디아 지수 종목 리스트를 가져오지 못했습니다.\n(사유: {str(e)})")
-        return # 함수 강제 종료
+    max_retries = 3  # 최대 3번 시도
+    retry_delay = 10 # 실패 시 10초 대기
+    
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🚀 종목 리스트 수집 시도 ({attempt}/{max_retries})...")
+            sp500_res = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=15)
+            sp500 = pd.read_html(sp500_res.text)[0]['Symbol'].tolist()
+            
+            nas100_res = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers, timeout=15)
+            nasdaq100 = pd.read_html(nas100_res.text)[0]['Symbol'].tolist()
+            
+            tickers = list(set(sp500 + nasdaq100))
+            tickers = [t.replace('.', '-') for t in tickers]
+            
+            if len(tickers) > 400: # 정상적으로 수집된 경우
+                print(f"✅ {len(tickers)}개 종목 수집 성공!")
+                break
+        except Exception as e:
+            print(f"⚠️ {attempt}차 수집 실패: {e}")
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+            else:
+                # 3번 모두 실패했을 때만 알림 전송
+                send_telegram(f"⚠️ <b>데이터 수집 최종 실패</b>\n3회 시도했으나 지수 종목 리스트를 가져오지 못했습니다.\n(사유: {str(e)})")
+                return
 
     total_scan = len(tickers)
-    step1_pass = 0 # 가격/유동성
-    step2_pass = 0 # RSI/거래량
-    final_pass = 0 # 최종
+    step1_pass = 0
+    step2_pass = 0
+    final_pass = 0
 
     msg_list = []
     
@@ -66,8 +83,7 @@ def analyze():
             avg_vol_20 = float(df['Volume'].rolling(20).mean().iloc[-1])
             turnover = curr_price * avg_vol_20
             
-            # --- [STEP 1: 가격 및 유동성 필터] ---
-            # 10 <= Price <= 300 & Turnover > 20M
+            # --- [STEP 1: 가격/유동성] ---
             if not (10 <= curr_price <= 300) or turnover < 20000000: continue
             step1_pass += 1
             
@@ -81,11 +97,11 @@ def analyze():
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
             rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
 
-            # --- [STEP 2: RSI 및 거래량 급감 필터] ---
+            # --- [STEP 2: RSI/거래량] ---
             if curr_vol >= (avg_vol_20 * 0.8) or rsi_val <= 35: continue
             step2_pass += 1
 
-            # --- [STEP 3: 기술적 매수 조건] ---
+            # --- [STEP 3: 기술적 조건] ---
             c1 = df['MA20'].iloc[-1] > df['MA50'].iloc[-1]
             c2 = (df['ADX'].iloc[-1] >= 20) and (df['ADX'].iloc[-1] >= df['ADX'].iloc[-2]) and (df['PDI'].iloc[-1] > df['MDI'].iloc[-1])
             c3 = (df['Close'].iloc[-1] <= df['BB_MID'].iloc[-1])
