@@ -33,12 +33,10 @@ def get_optimal_atr_mult(df):
         drawdown = entry_p - future_low
         if drawdown > 0: mae_list.append(drawdown / entry_atr)
     
-    # [퀀트 방패] 과거 기회가 10번 미만이면 데이터 부족으로 판단
     if len(mae_list) < 10:
         return None
     return np.percentile(mae_list, 90)
 
-# 1차 메인 수집 루트 (위키피디아)
 def fetch_wiki_tickers_safe(url):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
     try:
@@ -55,18 +53,15 @@ def fetch_wiki_tickers_safe(url):
     except: pass
     return []
 
-# 2차 우회 수집 루트 (GitHub Public CSV 및 Slickcharts)
 def fetch_fallback_tickers():
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
     try:
-        print("⚠️ 위키피디아 수집 실패. 우회 루트(CSV/대체사이트)로 명단 수집을 시도합니다.")
-        # S&P 500
+        print("⚠️ 위키피디아 수집 실패. 우회 루트 가동.")
         sp500_csv_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
         sp500_df = pd.read_csv(sp500_csv_url)
         if 'Symbol' in sp500_df.columns: tickers.extend(sp500_df['Symbol'].tolist())
         
-        # Nasdaq 100
         res = requests.get('https://www.slickcharts.com/nasdaq100', headers=headers, timeout=10)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
             f.write(res.text)
@@ -92,26 +87,20 @@ def analyze():
         print(f"⚠️ 위키피디아 {attempt}차 수집 실패...")
         time.sleep(5)
         
-    # 메인 루트 3회 실패 시 우회 루트 가동
     if len(tickers) < 400:
         fallback_list = fetch_fallback_tickers()
         tickers = list(set(fallback_list))
 
-    # 커스텀 라이징 스타 강제 추가
-    custom_stars = ["RKLB", "LUNR", "PLTR", "MSTR", "IONQ", "SMCI", "SOFI", "ASTS", "U"]
-    tickers = list(set(tickers + custom_stars))
+    # [수정] 커스텀 라이징 스타 리스트 삭제됨 (순수 지수 종목만 사용)
     tickers = [t.replace('.', '-') for t in tickers]
 
-    # 최종 명단 검수 (100개 미만이면 심각한 에러로 판단하여 중단)
     if len(tickers) < 100:
         send_telegram("⚠️ <b>데이터 수집 최종 실패</b>\n메인/우회 루트 모두 명단 확보에 실패했습니다.")
         return
 
-    # 기존 포맷 출력을 위한 카운터 변수 복구
     total_scan = len(tickers)
     step1_pass, step2_pass, final_pass = 0, 0, 0
     msg_list = []
-    
     start_date = "2023-01-01"
 
     for ticker in tickers:
@@ -125,7 +114,6 @@ def analyze():
             avg_vol_20 = float(df['Volume'].rolling(20).mean().iloc[-1])
             turnover = curr_price * avg_vol_20
 
-            # 1. 가격 및 거래대금 통과 확인
             if not (10 <= curr_price <= 300) or turnover < 20000000: continue
             step1_pass += 1
 
@@ -136,7 +124,6 @@ def analyze():
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
             rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
 
-            # 2. RSI 및 거래량 급감 통과 확인
             if curr_vol >= (avg_vol_20 * 0.8) or rsi_val <= 35: continue
             step2_pass += 1
 
@@ -146,7 +133,6 @@ def analyze():
             
             df['Buy_Signal_Historical'] = (df['MA20'] > df['MA50']) & (df['ADX'] >= 20) & (df['PDI'] > df['MDI']) & (df['Close'] <= df['BB_MID'])
 
-            # 3. 최종 매수 조건 통과 확인
             if c1 and c2 and c3:
                 final_pass += 1
                 opt_mult = get_optimal_atr_mult(df)
@@ -172,8 +158,6 @@ def analyze():
 
     header = f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n\n"
     body = "\n".join(msg_list) if final_pass > 0 else "❌ <b>오늘은 조건에 맞는 눌림목 종목이 없습니다.</b>\n"
-    
-    # 요청하신 기존 4줄 포맷으로 완벽 복구
     footer = (f"\n<b>[진단 결과]</b>\n"
               f"* 총 스캔 종목: {total_scan}개\n"
               f"* 가격/유동성 통과: {step1_pass}개\n"
