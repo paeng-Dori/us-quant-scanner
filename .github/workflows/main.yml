@@ -2,8 +2,9 @@ name: US-Quant-Auto-Scanner
 
 on:
   schedule:
-    - cron: '0 22 * * *'
-  workflow_dispatch:
+    # 한국 시간(KST) 기준 오전 8시, 오후 5시 (UTC 23:00, 08:00)
+    - cron: '0 23,8 * * *'
+  workflow_dispatch: # 언제든 수동으로 실행하고 싶을 때 사용
 
 jobs:
   run-scan:
