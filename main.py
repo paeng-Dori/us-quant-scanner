@@ -33,7 +33,6 @@ def get_optimal_atr_mult(df):
     return np.percentile(mae_list, 90) if mae_list else 2.5
 
 def analyze():
-    # 지수 종목 리스트 수집 (S&P 500 + Nasdaq 100)
     try:
         header = {"User-Agent": "Mozilla/5.0"}
         sp500 = pd.read_html(requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=header).text)[0]['Symbol'].tolist()
@@ -52,7 +51,6 @@ def analyze():
             if df.empty or len(df) < 60: continue
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-            # 지표 계산
             curr_price = float(df['Close'].iloc[-1])
             curr_vol = float(df['Volume'].iloc[-1])
             avg_vol_20 = float(df['Volume'].rolling(20).mean().iloc[-1])
@@ -67,20 +65,15 @@ def analyze():
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
             rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
 
-            # --- [필터링 및 매수 조건] ---
-            # 1. 가격 & 유동성 필터 ($10~$300 & $20M↑)
+            # 필터링 조건
             if not (10 <= curr_price <= 300) or turnover < 20000000: continue
-            
-            # 2. 거래량 급감 (80% 미만으로 수정) & RSI (35↑)
             cond_vol = curr_vol < (avg_vol_20 * 0.8)
             cond_rsi = rsi_val > 35
 
-            # 3. 기술적 조건
             c1 = df['MA20'].iloc[-1] > df['MA50'].iloc[-1]
             c2 = (df['ADX'].iloc[-1] >= 20) and (df['ADX'].iloc[-1] >= df['ADX'].iloc[-2]) and (df['PDI'].iloc[-1] > df['MDI'].iloc[-1])
             c3 = (df['Close'].iloc[-1] <= df['BB_MID'].iloc[-1])
             
-            # 과거 데이터 카운트용 (거래량 필터는 당일 기준이므로 제외하고 계산)
             df['Buy_Signal_Historical'] = (df['MA20'] > df['MA50']) & (df['ADX'] >= 20) & (df['PDI'] > df['MDI']) & (df['Close'] <= df['BB_MID'])
 
             if c1 and c2 and c3 and cond_vol and cond_rsi:
@@ -88,22 +81,21 @@ def analyze():
                 opt_mult = get_optimal_atr_mult(df)
                 stop_l = curr_price - (opt_mult * df['ATR'].iloc[-1])
                 qty = int(200 // (curr_price - stop_l)) if curr_price > stop_l else 0
-                
-                cnt_24 = df.loc['2024-01-01':'2024-12-31', 'Buy_Signal_Historical'].sum()
-                cnt_25 = df.loc['2025-01-01':, 'Buy_Signal_Historical'].sum()
+                cnt_total = int(df.loc['2024-01-01':, 'Buy_Signal_Historical'].sum())
 
+                # --- [요청하신 매수 포착 양식 반영] ---
                 msg_list.append(
-                    f"<b>★ {ticker}</b> (${curr_price:.2f})\n"
-                    f"└ 과거기회: 24~25년(총 {int(cnt_24+cnt_25)}회)\n"
-                    f"└ 최적손절: ATR x {opt_mult:.2f}배 (<b>${stop_l:.2f}</b>)\n"
-                    f"└ <b>추천수량: {qty}주</b>\n"
+                    f"🚀 <b>[매수 포착] {ticker}</b>\n"
+                    f"- 현재가 : ${curr_price:.2f}\n"
+                    f"- 과거기회 : 총 {cnt_total}회 (24~25년)\n"
+                    f"- 최적 손절가 : <b>${stop_l:.2f}</b> (ATR x {opt_mult:.2f}배)\n"
+                    f"- 추천수량 : <b>{qty}주</b>\n"
                 )
         except: continue
 
     if found > 0: 
         send_telegram("\n".join(msg_list))
     else: 
-        # 요청하신 "종목 없음" 멘트 수정
         send_telegram("❌ <b>오늘은 조건에 맞는 눌림목 종목이 없습니다.</b>")
 
 if __name__ == "__main__": analyze()
