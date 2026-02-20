@@ -143,6 +143,7 @@ def analyze():
             df['BB_MID'] = ta.bbands(df['Close'], 20, 2.0)['BBM_20_2.0']
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
             rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
+            current_atr = float(df['ATR'].iloc[-1]) # 현재 ATR 값 추출
 
             # 2단계: 수급 진공 (RSI 및 거래량 급감)
             if curr_vol >= (avg_vol_20 * 0.8) or rsi_val <= 35: continue
@@ -167,17 +168,26 @@ def analyze():
                 final_pass += 1
                 cnt_total = int(df.loc[start_date:, 'Buy_Signal_Historical'].sum())
 
-                # 수치 계산
-                stop_l = curr_price - (opt_mult * df['ATR'].iloc[-1])
-                entry_limit_p = curr_price * (1 + max_gap_limit / 100)
+                # 수치 계산 (현재가 기준)
+                stop_l = curr_price - (opt_mult * current_atr)
                 qty = int(200 // (curr_price - stop_l)) if curr_price > stop_l else 0
+                
+                # 수치 계산 (진입 제한가 기준)
+                entry_limit_p = curr_price * (1 + max_gap_limit / 100)
+                limit_stop_l = entry_limit_p - (opt_mult * current_atr) # 제한가로 진입했을 때의 손절가
 
+                # --- 🎯 요청하신 포맷으로 알림 메시지 생성 부분 수정 ---
                 msg_list.append(
                     f"🚀 <b>[매수 포착] {ticker}</b>\n"
-                    f"- 현재가 : ${curr_price:.2f}\n"
                     f"- 과거기회 : 총 {cnt_total}회 (23년~)\n"
-                    f"- 최적 손절가 : <b>${stop_l:.2f}</b> (ATR x {opt_mult:.2f}배)\n"
+                    f"- ATR : <b>${current_atr:.2f}</b>\n"
+                    f"\n"
+                    f"- 현재가 : ${curr_price:.2f}\n"
                     f"- <b>진입 제한가 : ${entry_limit_p:.2f} (갭 {max_gap_limit:.1f}% 이내)</b>\n"
+                    f"\n"
+                    f"- 현재가 진입시, 손절가 : ${stop_l:.2f} (ATR x {opt_mult:.2f}배)\n"
+                    f"- 제한가 진입시, 손절가 : <b>${limit_stop_l:.2f}</b>\n"
+                    f"\n"
                     f"- 추천수량 : <b>{qty}주</b>\n"
                 )
         except: continue
