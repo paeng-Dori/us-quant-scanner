@@ -33,28 +33,29 @@ def get_optimal_atr_mult(df):
     return np.percentile(mae_list, 90) if mae_list else 2.5
 
 def analyze():
-    # 지수 종목 리스트 수집
+    # 지수 종목 리스트 수집 (S&P 500 + Nasdaq 100)
     try:
-        sp500 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].tolist()
-        nasdaq100 = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[0]['Symbol'].tolist()
+        header = {"User-Agent": "Mozilla/5.0"}
+        sp500 = pd.read_html(requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=header).text)[0]['Symbol'].tolist()
+        nasdaq100 = pd.read_html(requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=header).text)[0]['Symbol'].tolist()
         tickers = list(set(sp500 + nasdaq100))
         tickers = [t.replace('.', '-') for t in tickers]
     except:
-        tickers = ["NVDA", "AAPL", "MSFT", "TSLA"]
+        tickers = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "META"]
 
-    msg_list = [f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n(기준: S&P500/나스닥100 우량주)\n"]
+    msg_list = [f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n"]
     found = 0
 
     for ticker in tickers:
         try:
             df = yf.download(ticker, start="2024-01-01", progress=False)
-            if len(df) < 60: continue
+            if df.empty or len(df) < 60: continue
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
             # 지표 계산
-            curr_price = df['Close'].iloc[-1]
-            curr_vol = df['Volume'].iloc[-1]
-            avg_vol_20 = df['Volume'].rolling(20).mean().iloc[-1]
+            curr_price = float(df['Close'].iloc[-1])
+            curr_vol = float(df['Volume'].iloc[-1])
+            avg_vol_20 = float(df['Volume'].rolling(20).mean().iloc[-1])
             turnover = curr_price * avg_vol_20
             
             df['MA20'] = ta.sma(df['Close'], 20)
@@ -62,24 +63,27 @@ def analyze():
             adx_df = ta.adx(df['High'], df['Low'], df['Close'], 14)
             df['ADX'], df['PDI'], df['MDI'] = adx_df['ADX_14'], adx_df['DMP_14'], adx_df['DMN_14']
             bb = ta.bbands(df['Close'], 20, 2.0)
-            df['BB_MID'], df['BB_LOW'] = bb['BBM_20_2.0'], bb['BBL_20_2.0']
+            df['BB_MID'] = bb['BBM_20_2.0']
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
-            df['RSI'] = ta.rsi(df['Close'], 14)
+            rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
 
             # --- [필터링 및 매수 조건] ---
             # 1. 가격 & 유동성 필터 ($10~$300 & $20M↑)
             if not (10 <= curr_price <= 300) or turnover < 20000000: continue
-            # 2. 거래량 급감 (0.7배) & RSI (35↑)
-            if curr_vol >= (avg_vol_20 * 0.7) or df['RSI'].iloc[-1] <= 35: continue
+            
+            # 2. 거래량 급감 (80% 미만으로 수정) & RSI (35↑)
+            cond_vol = curr_vol < (avg_vol_20 * 0.8)
+            cond_rsi = rsi_val > 35
 
             # 3. 기술적 조건
-            c1 = df['MA20'] > df['MA50']
-            c2 = (df['ADX'] >= 20) & (df['ADX'] >= df['ADX'].shift(1)) & (df['PDI'] > df['MDI'])
-            c3 = (df['Close'] <= df['BB_MID']) & (df['Close'] > df['BB_LOW'])
+            c1 = df['MA20'].iloc[-1] > df['MA50'].iloc[-1]
+            c2 = (df['ADX'].iloc[-1] >= 20) and (df['ADX'].iloc[-1] >= df['ADX'].iloc[-2]) and (df['PDI'].iloc[-1] > df['MDI'].iloc[-1])
+            c3 = (df['Close'].iloc[-1] <= df['BB_MID'].iloc[-1])
             
-            df['Buy_Signal_Historical'] = c1 & c2 & c3
+            # 과거 데이터 카운트용 (거래량 필터는 당일 기준이므로 제외하고 계산)
+            df['Buy_Signal_Historical'] = (df['MA20'] > df['MA50']) & (df['ADX'] >= 20) & (df['PDI'] > df['MDI']) & (df['Close'] <= df['BB_MID'])
 
-            if c1 and c2 and c3:
+            if c1 and c2 and c3 and cond_vol and cond_rsi:
                 found += 1
                 opt_mult = get_optimal_atr_mult(df)
                 stop_l = curr_price - (opt_mult * df['ATR'].iloc[-1])
@@ -96,7 +100,10 @@ def analyze():
                 )
         except: continue
 
-    if found > 0: send_telegram("\n".join(msg_list))
-    else: send_telegram("<b>📅 {datetime.now().date()}</b>\n❄️ 오늘 조건에 맞는 우량 눌림목 종목이 없습니다.")
+    if found > 0: 
+        send_telegram("\n".join(msg_list))
+    else: 
+        # 요청하신 "종목 없음" 멘트 수정
+        send_telegram("❌ <b>오늘은 조건에 맞는 눌림목 종목이 없습니다.</b>")
 
 if __name__ == "__main__": analyze()
