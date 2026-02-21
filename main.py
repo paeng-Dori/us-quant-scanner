@@ -50,15 +50,19 @@ def get_optimal_metrics(df):
     historical_gaps = []
     reversal_strengths = []
     
-    # 실전 타점과 동일한 거래량 조건(is_vol_ok)을 백테스트에도 추가
     df['avg_v20'] = ta.sma(df['Volume'], 20)
     df['prev_v'] = df['Volume'].shift(1)
-    df['is_vol_ok'] = (df['Volume'] > df['prev_v']) & (df['Volume'] < df['avg_v20'] * 3.0)
+    
+    # [수급 트리거 보완] 전일 패닉셀/대량거래(1.5배 초과) 기저효과 방어 로직 적용
+    cond_increase = df['Volume'] > df['prev_v']
+    cond_exception = (df['prev_v'] > df['avg_v20'] * 1.5) & (df['Volume'] > df['avg_v20'])
+    df['is_vol_ok'] = (cond_increase | cond_exception) & (df['Volume'] < df['avg_v20'] * 3.0)
     
     df['is_green'] = df['Close'] > df['Open']
     df['c_range'] = df['High'] - df['Low']
     df['rev_pos'] = np.where(df['c_range'] > 0, (df['Close'] - df['Low']) / df['c_range'], 0)
     
+    # 완벽하게 동기화된 과거 매수 시그널
     df['Sync_Signal'] = (df['MA20'] > df['MA50']) & \
                         (df['Close'] <= df['BB_MID']) & \
                         (df['is_green']) & \
@@ -86,9 +90,9 @@ def get_optimal_metrics(df):
         if f_max > close_p and atr_p > 0: 
             reversal_strengths.append((close_p - low_p) / atr_p)
     
-    # [핵심 보완] 데이터가 부족한 '슈퍼 스톡'을 버리지 않고 기본값 부여
+    # 데이터가 부족한 '슈퍼 스톡'을 버리지 않고 기본값 부여 (강력한 주도주 보호)
     if len(mae_list) < 10 or len(reversal_strengths) < 5: 
-        return 2.0, 2.0, 0.5 # (opt_mult=2.0 ATR, max_gap=2.0%, min_rev=0.5)
+        return 2.0, 2.0, 0.5 
         
     opt_mult = max(np.percentile(mae_list, 90), 2.0) 
     max_gap_threshold = np.percentile(historical_gaps, 80)
@@ -149,7 +153,7 @@ def fetch_fallback_tickers():
 
 # --- [4. 메인 분석 로직] ---
 def analyze():
-    # 항상 실행하는 날짜를 기준으로 '최근 3년 치' 데이터만 똑똑하게 불러옵니다.
+    # 항상 실행 시점 기준 '최근 3년 치' 동적 다운로드 (속도 및 유지보수 최적화)
     start_date = (pd.Timestamp.now() - pd.DateOffset(years=3)).strftime('%Y-%m-%d')
     
     print(f"🚀 스캔 시작: {datetime.now()} (데이터 수집 기준일: {start_date})")
@@ -258,8 +262,10 @@ def analyze():
             # 1. 구역(Zone)
             is_zone = float(df['MA20'].iloc[-1]) > float(df['MA50'].iloc[-1]) and cp <= float(df['BB_MID'].iloc[-1])
             
-            # 2. 수급(Volume)
-            is_vol_ok = (cv > prev_v) and (cv < avg_v20 * 3.0)
+            # 2. 수급(Volume) 트리거 보완 - 전일 1.5배 초과시 오늘 평균 이상만 되어도 패스
+            cond_increase = cv > prev_v
+            cond_exception = (prev_v > avg_v20 * 1.5) and (cv > avg_v20)
+            is_vol_ok = (cond_increase or cond_exception) and (cv < avg_v20 * 3.0)
             
             # 3. 캔들(Hammer) 트리거
             c_range = float(df['High'].iloc[-1]) - float(df['Low'].iloc[-1])
