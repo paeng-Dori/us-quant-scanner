@@ -90,15 +90,18 @@ def get_optimal_metrics(df):
         if f_max > close_p and atr_p > 0: 
             reversal_strengths.append((close_p - low_p) / atr_p)
     
-    # 데이터가 부족한 '슈퍼 스톡'을 버리지 않고 기본값 부여 (강력한 주도주 보호)
+    # 데이터가 부족한 '슈퍼 스톡'을 버리지 않고 기본값 부여 (is_defense = True 전달)
     if len(mae_list) < 10 or len(reversal_strengths) < 5: 
-        return 2.0, 2.0, 0.5 
+        return 2.0, 2.0, 0.5, True 
         
-    opt_mult = max(np.percentile(mae_list, 90), 2.0) 
+    raw_opt_mult = np.percentile(mae_list, 90)
+    is_defense = raw_opt_mult <= 2.0 # 원본 데이터가 2.0 이하면 방어 발동
+    opt_mult = max(raw_opt_mult, 2.0) 
+    
     max_gap_threshold = np.percentile(historical_gaps, 80)
     min_reversal_factor = np.percentile(reversal_strengths, 25) 
     
-    return opt_mult, max_gap_threshold, min_reversal_factor
+    return opt_mult, max_gap_threshold, min_reversal_factor, is_defense
 
 def calc_rs_score(df, spy_df):
     """가중 누적 수익률을 활용한 상대강도(RS) 점수 산출"""
@@ -153,22 +156,29 @@ def fetch_fallback_tickers():
 
 # --- [4. 메인 분석 로직] ---
 def analyze():
-    # 항상 실행 시점 기준 '최근 3년 치' 동적 다운로드 (속도 및 유지보수 최적화)
     start_date = (pd.Timestamp.now() - pd.DateOffset(years=3)).strftime('%Y-%m-%d')
     
     print(f"🚀 스캔 시작: {datetime.now()} (데이터 수집 기준일: {start_date})")
     
-    # 1. 시장 필터 (SPY & VIX)
+    # 1. 시장 필터 (SPY & VIX 에러 방어 로직 추가)
     print("시장 상태(SPY/VIX) 확인 중...")
-    m_data = yf.download(["SPY", "^VIX"], start=start_date, progress=False)['Close']
-    if m_data.empty:
-        send_telegram("⚠️ <b>시장 데이터 로드 실패</b>\n지수 데이터를 가져오지 못해 스캔을 중단합니다.")
+    try:
+        m_data = yf.download(["SPY", "^VIX"], start=start_date, progress=False)['Close']
+    except Exception as e:
+        print(f"⚠️ 시장 데이터 다운로드 실패: {e}")
+        return
+        
+    if m_data.empty or 'SPY' not in m_data or '^VIX' not in m_data:
+        print("⚠️ 시장 데이터를 불러올 수 없습니다.")
         return
         
     spy = m_data['SPY'].dropna()
     vix = m_data['^VIX'].dropna()
     
-    if len(spy) < 200: return
+    # VIX나 SPY 데이터가 비정상적으로 적으면 스캔 중단 (IndexError 원천 차단)
+    if len(spy) < 200 or len(vix) < 1: 
+        print("⚠️ 지수 데이터가 부족하거나 누락되어 안전을 위해 스캔을 중단합니다.")
+        return
     
     spy_ma200 = ta.sma(spy, 200)
     spy_ma5 = ta.sma(spy, 5)
@@ -262,7 +272,7 @@ def analyze():
             # 1. 구역(Zone)
             is_zone = float(df['MA20'].iloc[-1]) > float(df['MA50'].iloc[-1]) and cp <= float(df['BB_MID'].iloc[-1])
             
-            # 2. 수급(Volume) 트리거 보완 - 전일 1.5배 초과시 오늘 평균 이상만 되어도 패스
+            # 2. 수급(Volume) 트리거 보완
             cond_increase = cv > prev_v
             cond_exception = (prev_v > avg_v20 * 1.5) and (cv > avg_v20)
             is_vol_ok = (cond_increase or cond_exception) and (cv < avg_v20 * 3.0)
@@ -273,7 +283,7 @@ def analyze():
             is_trigger = cp > float(df['Open'].iloc[-1]) and rev_pos >= 0.6
             
             if is_zone and is_vol_ok and is_trigger:
-                opt_mult, max_gap_limit, min_rev_factor = get_optimal_metrics(df)
+                opt_mult, max_gap_limit, min_rev_factor, is_defense = get_optimal_metrics(df)
                 if opt_mult is None: continue
                 
                 curr_rev_strength = (cp - float(df['Low'].iloc[-1])) / float(df['ATR'].iloc[-1])
@@ -287,7 +297,9 @@ def analyze():
                     entry_limit_p = cp * (1 + max_gap_limit / 100)
                     limit_stop_l = entry_limit_p - (opt_mult * float(df['ATR'].iloc[-1]))
 
-                    # [수정 완료] 실전 주문서 형태의 직관적인 알림 메시지
+                    # 동적/방어 ATR 라벨 생성
+                    atr_label = "하한선 방어" if is_defense else "동적 계산"
+
                     msg_list.append(
                         f"🚀 <b>[실전 주문] {ticker}</b> (RS Rank: {rs_ranks[ticker]:.1f})\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
@@ -296,7 +308,7 @@ def analyze():
                         f"📦 <b>매수 수량 : {qty}주</b> (리스크 $200 고정)\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"📉 참조 종가 : ${cp:.2f} (전일 종가)\n"
-                        f"🛡️ 방어 기준 : ATR {opt_mult:.2f}배 적용\n"
+                        f"🛡️ 방어 기준 : ATR {opt_mult:.2f}배 적용 ({atr_label})\n"
                         f"💡 반등 강도 : {curr_rev_strength:.2f} (최소 {min_rev_factor:.2f})\n\n"
                     )
         except Exception:
