@@ -149,8 +149,10 @@ def fetch_fallback_tickers():
 
 # --- [4. 메인 분석 로직] ---
 def analyze():
-    start_date = "2023-01-01"
-    print(f"🚀 스캔 시작: {datetime.now()}")
+    # 항상 실행하는 날짜를 기준으로 '최근 3년 치' 데이터만 똑똑하게 불러옵니다.
+    start_date = (pd.Timestamp.now() - pd.DateOffset(years=3)).strftime('%Y-%m-%d')
+    
+    print(f"🚀 스캔 시작: {datetime.now()} (데이터 수집 기준일: {start_date})")
     
     # 1. 시장 필터 (SPY & VIX)
     print("시장 상태(SPY/VIX) 확인 중...")
