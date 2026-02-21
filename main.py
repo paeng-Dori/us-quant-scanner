@@ -19,7 +19,7 @@ CHAT_ID = os.environ.get('TG_CHAT_ID')
 def send_telegram(message):
     """텔레그램 단일 메시지 발송 함수"""
     if not BOT_TOKEN or not CHAT_ID: 
-        print("텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
+        print("⚠️ 텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
         print(message)
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -41,30 +41,35 @@ def send_telegram_chunks(msg_list, header, footer):
         body = "\n".join(chunk)
         title = f"{header} (파트 {i//chunk_size + 1})\n\n"
         send_telegram(title + body + (footer if i + chunk_size >= len(msg_list) else ""))
+        time.sleep(1) # API 도배 방지 딜레이
 
 # --- [2. 핵심 퀀트 엔진] ---
 def get_optimal_metrics(df):
-    """과거 시그널을 실전 타점 로직(캔들 트리거)과 100% 동기화하여 정밀도 향상"""
+    """과거 시그널을 실전 타점 로직(캔들+수급 트리거)과 100% 동기화하여 정밀도 향상"""
     mae_list = []
     historical_gaps = []
     reversal_strengths = []
     
-    # [백테스트 정밀도 향상] 과거 데이터에도 '양봉 + 0.6 이상 꼬리' 조건을 적용
+    # 실전 타점과 동일한 거래량 조건(is_vol_ok)을 백테스트에도 추가
+    df['avg_v20'] = ta.sma(df['Volume'], 20)
+    df['prev_v'] = df['Volume'].shift(1)
+    df['is_vol_ok'] = (df['Volume'] > df['prev_v']) & (df['Volume'] < df['avg_v20'] * 3.0)
+    
     df['is_green'] = df['Close'] > df['Open']
     df['c_range'] = df['High'] - df['Low']
-    # 분모가 0이 되는 에러 방지 (np.where 사용)
     df['rev_pos'] = np.where(df['c_range'] > 0, (df['Close'] - df['Low']) / df['c_range'], 0)
     
     df['Sync_Signal'] = (df['MA20'] > df['MA50']) & \
                         (df['Close'] <= df['BB_MID']) & \
                         (df['is_green']) & \
-                        (df['rev_pos'] >= 0.6)
+                        (df['rev_pos'] >= 0.6) & \
+                        (df['is_vol_ok']) 
     
     signals = df[df['Sync_Signal']].index
     
     for idx in signals:
         loc = df.index.get_loc(idx)
-        if loc + 11 >= len(df): continue # 미래 10일치 데이터가 없으면 패스
+        if loc + 11 >= len(df): continue 
         
         close_p = float(df.iloc[loc]['Close'])
         atr_p = float(df.iloc[loc]['ATR'])
@@ -81,11 +86,10 @@ def get_optimal_metrics(df):
         if f_max > close_p and atr_p > 0: 
             reversal_strengths.append((close_p - low_p) / atr_p)
     
-    # 모수가 너무 적으면 통계적 의미가 없으므로 제외
+    # [핵심 보완] 데이터가 부족한 '슈퍼 스톡'을 버리지 않고 기본값 부여
     if len(mae_list) < 10 or len(reversal_strengths) < 5: 
-        return None, None, None
+        return 2.0, 2.0, 0.5 # (opt_mult=2.0 ATR, max_gap=2.0%, min_rev=0.5)
         
-    # 터틀 트레이딩 가드레일 (최소 2.0 ATR 손절폭 보장)
     opt_mult = max(np.percentile(mae_list, 90), 2.0) 
     max_gap_threshold = np.percentile(historical_gaps, 80)
     min_reversal_factor = np.percentile(reversal_strengths, 25) 
@@ -109,7 +113,6 @@ def calc_rs_score(df, spy_df):
 
 # --- [3. 유니버스 데이터 수집 함수] ---
 def fetch_wiki_tickers_safe(url):
-    """위키피디아에서 S&P 500, Nasdaq 100 티커 수집"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         res = requests.get(url, headers=headers, timeout=10)
@@ -126,7 +129,6 @@ def fetch_wiki_tickers_safe(url):
     return []
 
 def fetch_fallback_tickers():
-    """위키피디아 수집 실패 시 우회 루트"""
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -168,7 +170,6 @@ def analyze():
     spy_curr = float(spy.iloc[-1])
     vix_curr = float(vix.iloc[-1])
     
-    # 200일선 위 & 5일선 위 & 공포지수 25 미만 조건 모두 충족해야 안전장으로 판단
     if not (spy_curr > float(spy_ma200.iloc[-1]) and spy_curr > float(spy_ma5.iloc[-1]) and vix_curr < 25):
         send_telegram(f"⚠️ <b>시장 필터 작동 (매수 중단)</b>\nS&P 500 추세 이탈 또는 VIX 지수({vix_curr:.2f}) 불안정으로 현금을 보호합니다.")
         return
@@ -214,13 +215,11 @@ def analyze():
             cp = float(df['Close'].iloc[-1])
             avg_v20 = float(df['Volume'].rolling(20).mean().iloc[-1])
             
-            # 동전주 컷 & 유동성 필터
             if cp < 10 or (cp * avg_v20 < 20000000): continue
             
             df['MA200'] = ta.sma(df['Close'], 200)
             df['MA50'] = ta.sma(df['Close'], 50)
             
-            # 주도주 기본 조건: 가격이 200일선과 50일선 위에 있어야 함
             if cp > float(df['MA200'].iloc[-1]) and cp > float(df['MA50'].iloc[-1]):
                 score = calc_rs_score(df, spy)
                 if score > 0:
@@ -254,23 +253,21 @@ def analyze():
             prev_v = float(df['Volume'].iloc[-2])
             avg_v20 = float(df['Volume'].rolling(20).mean().iloc[-1])
             
-            # 조건 1. 구역(Zone)
+            # 1. 구역(Zone)
             is_zone = float(df['MA20'].iloc[-1]) > float(df['MA50'].iloc[-1]) and cp <= float(df['BB_MID'].iloc[-1])
             
-            # 조건 2. 수급(Volume) - 어제보다 증가하되 평균 3배 이내의 이성적 반등
+            # 2. 수급(Volume)
             is_vol_ok = (cv > prev_v) and (cv < avg_v20 * 3.0)
             
-            # 조건 3. 캔들(Hammer) 트리거 - 양봉 & 종가가 전체 캔들의 60% 이상 상단에 마감
+            # 3. 캔들(Hammer) 트리거
             c_range = float(df['High'].iloc[-1]) - float(df['Low'].iloc[-1])
             rev_pos = (cp - float(df['Low'].iloc[-1])) / c_range if c_range > 0 else 0
             is_trigger = cp > float(df['Open'].iloc[-1]) and rev_pos >= 0.6
             
             if is_zone and is_vol_ok and is_trigger:
-                # 과거 데이터 검증 및 손절/목표가 수치 산출
                 opt_mult, max_gap_limit, min_rev_factor = get_optimal_metrics(df)
                 if opt_mult is None: continue
                 
-                # 현재 반등 강도가 과거 통과 기준을 넘었는지 확인
                 curr_rev_strength = (cp - float(df['Low'].iloc[-1])) / float(df['ATR'].iloc[-1])
                 
                 if curr_rev_strength >= min_rev_factor:
@@ -305,6 +302,6 @@ def analyze():
     send_telegram_chunks(msg_list, header, footer)
 
 if __name__ == "__main__":
-    print("🚀 PRO 버전 퀀트 스캐너 가동을 시작합니다...")
+    print("🚀 PRO-MASTER 버전 퀀트 스캐너 가동을 시작합니다...")
     analyze()
     print("✅ 스캔 및 알림 프로세스가 정상 종료되었습니다.")
