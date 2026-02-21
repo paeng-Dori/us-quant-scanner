@@ -22,6 +22,7 @@ def get_optimal_metrics(df):
     """최적 ATR 배수(손절)와 최대 허용 갭 임계치(진입 제한)를 산출"""
     mae_list = []
     historical_gaps = []
+    
     signals = df[df['Buy_Signal_Historical']].index
     
     for idx in signals:
@@ -41,7 +42,7 @@ def get_optimal_metrics(df):
         if drawdown > 0 and entry_atr > 0:
             mae_list.append(drawdown / entry_atr)
     
-    # [퀀트 방패] 샘플 10개 미만 시 데이터 부족으로 판단 (아예 제외 처리용)
+    # [퀀트 방패] 샘플 10개 미만 시 데이터 부족으로 판단
     if len(mae_list) < 10:
         return None, None
         
@@ -50,6 +51,24 @@ def get_optimal_metrics(df):
     max_gap_threshold = np.percentile(historical_gaps, 80)
     
     return opt_mult, max_gap_threshold
+
+def calc_rs_score(df, spy_df):
+    """가중 누적 수익률을 활용한 개별 종목의 RS 점수(절대값) 계산"""
+    try:
+        # 기준일(분기 단위: 대략 63, 126, 189, 252 거래일)
+        periods = [63, 126, 189, 252]
+        weights = [0.4, 0.2, 0.2, 0.2] # 최근 성과에 가장 높은 가중치 40%
+        score = 0
+        
+        for p, w in zip(periods, weights):
+            if len(df) > p and len(spy_df) > p:
+                stock_ret = df['Close'].iloc[-1] / df['Close'].iloc[-p]
+                spy_ret = spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-p]
+                relative_ret = stock_ret / spy_ret 
+                score += relative_ret * w
+        return score
+    except:
+        return 0
 
 # 1차 메인 수집 루트 (위키피디아)
 def fetch_wiki_tickers_safe(url):
@@ -68,7 +87,7 @@ def fetch_wiki_tickers_safe(url):
     except: pass
     return []
 
-# 2차 우회 수집 루트 (GitHub Public CSV 및 Slickcharts)
+# 2차 우회 수집 루트
 def fetch_fallback_tickers():
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
@@ -94,7 +113,7 @@ def analyze():
     tickers = []
     max_retries = 3
     
-    # 1. 유니버스 구성 (메인 루트)
+    # 1. 유니버스 구성
     for attempt in range(1, max_retries + 1):
         sp500 = fetch_wiki_tickers_safe('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
         nasdaq100 = fetch_wiki_tickers_safe('https://en.wikipedia.org/wiki/Nasdaq-100')
@@ -103,29 +122,32 @@ def analyze():
         print(f"⚠️ 위키피디아 {attempt}차 수집 실패...")
         time.sleep(5)
         
-    # 메인 루트 3회 실패 시 우회 루트 가동
     if len(tickers) < 400:
-        fallback_list = fetch_fallback_tickers()
-        tickers = list(set(fallback_list))
+        tickers = list(set(fetch_fallback_tickers()))
 
-    # 순수 S&P500 및 나스닥 100 종목만 사용 (형식 변환)
     tickers = [t.replace('.', '-') for t in tickers]
 
-    # 최종 명단 검수
     if len(tickers) < 100:
         send_telegram("⚠️ <b>데이터 수집 최종 실패</b>\n메인/우회 루트 모두 명단 확보에 실패했습니다.")
         return
 
-    total_scan = len(tickers)
-    step1_pass, step2_pass, final_pass = 0, 0, 0
-    msg_list = []
-    
+    # 벤치마크(SPY) 데이터 사전 로드
     start_date = "2023-01-01"
+    print("벤치마크(SPY) 데이터 다운로드 중...")
+    spy_df = yf.download("SPY", start=start_date, progress=False)
+    if isinstance(spy_df.columns, pd.MultiIndex): spy_df.columns = spy_df.columns.get_level_values(0)
 
+    total_scan = len(tickers)
+    step1_pass, step2_pass, rs_pass, final_pass = 0, 0, 0, 0
+    
+    candidates_data = {} 
+    rs_scores = {}
+
+    print("종목 스캔 및 기술적/RS 지표 계산 중...")
     for ticker in tickers:
         try:
             df = yf.download(ticker, start=start_date, progress=False)
-            if df.empty or len(df) < 60: continue
+            if df.empty or len(df) < 260: continue 
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
             curr_price = float(df['Close'].iloc[-1])
@@ -138,47 +160,58 @@ def analyze():
             step1_pass += 1
 
             df['MA20'], df['MA50'] = ta.sma(df['Close'], 20), ta.sma(df['Close'], 50)
-            adx_df = ta.adx(df['High'], df['Low'], df['Close'], 14)
-            df['ADX'], df['PDI'], df['MDI'] = adx_df['ADX_14'], adx_df['DMP_14'], adx_df['DMN_14']
             df['BB_MID'] = ta.bbands(df['Close'], 20, 2.0)['BBM_20_2.0']
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
             rsi_val = ta.rsi(df['Close'], 14).iloc[-1]
-            current_atr = float(df['ATR'].iloc[-1]) # 현재 ATR 값 추출
+            current_atr = float(df['ATR'].iloc[-1])
 
-            # 2단계: 수급 진공 (RSI 및 거래량 급감)
+            # 2단계: 수급 상태 체크 (RSI 및 거래량 급감)
             if curr_vol >= (avg_vol_20 * 0.8) or rsi_val <= 35: continue
             step2_pass += 1
 
-            # 3단계: 추세 및 볼린저 밴드 하단 타점
+            # 추세 및 타점 확인 (ADX, PDI, MDI 삭제됨)
             c1 = df['MA20'].iloc[-1] > df['MA50'].iloc[-1]
-            c2 = (df['ADX'].iloc[-1] >= 20) and (df['ADX'].iloc[-1] >= df['ADX'].iloc[-2]) and (df['PDI'].iloc[-1] > df['MDI'].iloc[-1])
             c3 = (df['Close'].iloc[-1] <= df['BB_MID'].iloc[-1])
             
-            df['Buy_Signal_Historical'] = (df['MA20'] > df['MA50']) & (df['ADX'] >= 20) & (df['PDI'] > df['MDI']) & (df['Close'] <= df['BB_MID'])
+            df['Buy_Signal_Historical'] = (df['MA20'] > df['MA50']) & (df['Close'] <= df['BB_MID'])
 
-            if c1 and c2 and c3:
-                # 데이터 검증: 과거 10회 이상 신호가 있었는지 확인
+            if c1 and c3:
+                score = calc_rs_score(df, spy_df)
+                if score > 0:
+                    rs_scores[ticker] = score
+                    candidates_data[ticker] = {
+                        'df': df, 'curr_price': curr_price, 'current_atr': current_atr
+                    }
+        except: continue
+
+    # RS 랭킹 산출 및 최종 필터링
+    msg_list = []
+    if rs_scores:
+        rs_series = pd.Series(rs_scores)
+        rs_ranks = rs_series.rank(pct=True) * 100 
+        
+        for ticker, rank in rs_ranks.items():
+            if rank >= 80:
+                rs_pass += 1
+                data = candidates_data[ticker]
+                df = data['df']
+                curr_price = data['curr_price']
+                current_atr = data['current_atr']
+                
                 opt_mult, max_gap_limit = get_optimal_metrics(df)
+                if opt_mult is None: continue
                 
-                # 🚫 10회 미만인 경우 최종 단계에서 탈락 처리 (알림 스킵)
-                if opt_mult is None:
-                    continue
-                
-                # 10회 이상 검증된 종목만 최종 합격 처리
                 final_pass += 1
                 cnt_total = int(df.loc[start_date:, 'Buy_Signal_Historical'].sum())
 
-                # 수치 계산 (현재가 기준)
                 stop_l = curr_price - (opt_mult * current_atr)
                 qty = int(200 // (curr_price - stop_l)) if curr_price > stop_l else 0
                 
-                # 수치 계산 (진입 제한가 기준)
                 entry_limit_p = curr_price * (1 + max_gap_limit / 100)
-                limit_stop_l = entry_limit_p - (opt_mult * current_atr) # 제한가로 진입했을 때의 손절가
+                limit_stop_l = entry_limit_p - (opt_mult * current_atr)
 
-                # --- 🎯 요청하신 포맷으로 알림 메시지 생성 부분 수정 ---
                 msg_list.append(
-                    f"🚀 <b>[매수 포착] {ticker}</b>\n"
+                    f"🚀 <b>[매수 포착] {ticker}</b> (RS Rank: <b>{rank:.1f}</b>)\n"
                     f"- 과거기회 : 총 {cnt_total}회 (23년~)\n"
                     f"- ATR : <b>${current_atr:.2f}</b>\n"
                     f"\n"
@@ -190,16 +223,16 @@ def analyze():
                     f"\n"
                     f"- 추천수량 : <b>{qty}주</b>\n"
                 )
-        except: continue
 
     header = f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n\n"
-    body = "\n".join(msg_list) if final_pass > 0 else "❌ <b>오늘은 조건에 맞는 눌림목 종목이 없습니다.</b>\n"
+    body = "\n".join(msg_list) if final_pass > 0 else "❌ <b>오늘은 조건에 맞는 1급(RS 80+) 눌림목 종목이 없습니다.</b>\n"
     
     footer = (f"\n<b>[진단 결과]</b>\n"
               f"* 총 스캔 종목: {total_scan}개\n"
               f"* 가격/유동성 통과: {step1_pass}개\n"
-              f"* RSI/거래량 급감 통과: {step2_pass}개\n"
-              f"* 최종 매수 조건 통과: {final_pass}개")
+              f"* <b>수급 상태 체크 통과: {step2_pass}개</b>\n"
+              f"* RS 80+ 통과: {rs_pass}개\n"
+              f"* 최종 매수(데이터 검증) 통과: {final_pass}개")
     
     send_telegram(header + body + footer)
 
