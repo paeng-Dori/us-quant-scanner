@@ -287,18 +287,17 @@ def analyze():
                     entry_limit_p = cp * (1 + max_gap_limit / 100)
                     limit_stop_l = entry_limit_p - (opt_mult * float(df['ATR'].iloc[-1]))
 
+                    # [수정 완료] 실전 주문서 형태의 직관적인 알림 메시지
                     msg_list.append(
-                        f"🚀 <b>[매수 포착] {ticker}</b> (RS Rank: <b>{rs_ranks[ticker]:.1f}</b>)\n"
-                        f"- ATR : <b>${float(df['ATR'].iloc[-1]):.2f}</b>\n"
-                        f"\n"
-                        f"- 현재가 : ${cp:.2f}\n"
-                        f"- <b>진입 제한가 : ${entry_limit_p:.2f} (갭 {max_gap_limit:.1f}% 이내)</b>\n"
-                        f"\n"
-                        f"- 현재가 진입시 손절가 : ${stop_l:.2f} (ATR x {opt_mult:.2f}배)\n"
-                        f"- 제한가 진입시 손절가 : <b>${limit_stop_l:.2f}</b>\n"
-                        f"\n"
-                        f"- 추천수량 : <b>{qty}주</b>\n"
-                        f"💡 <i>반등강도: {curr_rev_strength:.2f} (최소기준 {min_rev_factor:.2f} 통과)</i>\n"
+                        f"🚀 <b>[실전 주문] {ticker}</b> (RS Rank: {rs_ranks[ticker]:.1f})\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🎯 <b>지정가 매수 : ${entry_limit_p:.2f}</b> (이하 체결)\n"
+                        f"🛑 <b>스탑로스(SL): ${limit_stop_l:.2f}</b>\n"
+                        f"📦 <b>매수 수량 : {qty}주</b> (리스크 $200 고정)\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📉 참조 종가 : ${cp:.2f} (전일 종가)\n"
+                        f"🛡️ 방어 기준 : ATR {opt_mult:.2f}배 적용\n"
+                        f"💡 반등 강도 : {curr_rev_strength:.2f} (최소 {min_rev_factor:.2f})\n\n"
                     )
         except Exception:
             continue
