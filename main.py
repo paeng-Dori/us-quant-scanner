@@ -17,7 +17,7 @@ BOT_TOKEN = os.environ.get('TG_TOKEN')
 CHAT_ID = os.environ.get('TG_CHAT_ID')
 
 def send_telegram(message):
-    """텔레그램 메시지 발송 함수"""
+    """텔레그램 단일 메시지 발송 함수"""
     if not BOT_TOKEN or not CHAT_ID: 
         print("텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
         print(message)
@@ -29,71 +29,87 @@ def send_telegram(message):
     except Exception as e:
         print(f"텔레그램 발송 실패: {e}")
 
+def send_telegram_chunks(msg_list, header, footer):
+    """메시지 길이 초과 방지를 위한 분할 발송 (5개 단위)"""
+    if not msg_list:
+        send_telegram(header + "❌ <b>오늘은 조건에 맞는 1급 주도주가 없습니다.</b>\n" + footer)
+        return
+        
+    chunk_size = 5
+    for i in range(0, len(msg_list), chunk_size):
+        chunk = msg_list[i:i + chunk_size]
+        body = "\n".join(chunk)
+        title = f"{header} (파트 {i//chunk_size + 1})\n\n"
+        send_telegram(title + body + (footer if i + chunk_size >= len(msg_list) else ""))
+
+# --- [2. 핵심 퀀트 엔진] ---
 def get_optimal_metrics(df):
-    """최적 ATR 배수(손절), 허용 갭, 종목별 최소 반등 강도 산출 (터틀 2.0 ATR 플로어 적용)"""
+    """과거 시그널을 실전 타점 로직(캔들 트리거)과 100% 동기화하여 정밀도 향상"""
     mae_list = []
     historical_gaps = []
     reversal_strengths = []
     
-    signals = df[df['Buy_Signal_Historical']].index
+    # [백테스트 정밀도 향상] 과거 데이터에도 '양봉 + 0.6 이상 꼬리' 조건을 적용
+    df['is_green'] = df['Close'] > df['Open']
+    df['c_range'] = df['High'] - df['Low']
+    # 분모가 0이 되는 에러 방지 (np.where 사용)
+    df['rev_pos'] = np.where(df['c_range'] > 0, (df['Close'] - df['Low']) / df['c_range'], 0)
+    
+    df['Sync_Signal'] = (df['MA20'] > df['MA50']) & \
+                        (df['Close'] <= df['BB_MID']) & \
+                        (df['is_green']) & \
+                        (df['rev_pos'] >= 0.6)
+    
+    signals = df[df['Sync_Signal']].index
     
     for idx in signals:
         loc = df.index.get_loc(idx)
-        if loc + 1 >= len(df): continue
+        if loc + 11 >= len(df): continue # 미래 10일치 데이터가 없으면 패스
         
         close_p = float(df.iloc[loc]['Close'])
-        low_p = float(df.iloc[loc]['Low'])
         atr_p = float(df.iloc[loc]['ATR'])
+        low_p = float(df.iloc[loc]['Low'])
         next_open_p = float(df.iloc[loc+1]['Open'])
         
-        # 1. 갭 데이터 수집
-        gap_pct = ((next_open_p - close_p) / close_p) * 100
-        historical_gaps.append(gap_pct)
+        historical_gaps.append(((next_open_p - close_p) / close_p) * 100)
 
-        # 2. MAE(최대 역행) 및 성공 반등 강도 수집
-        if loc + 10 >= len(df): continue
-        future_low = float(df.iloc[loc+1 : loc+11]['Low'].min())
-        future_max = float(df.iloc[loc+1 : loc+11]['High'].max())
+        f_low = float(df.iloc[loc+1 : loc+11]['Low'].min())
+        f_max = float(df.iloc[loc+1 : loc+11]['High'].max())
         
-        # 손절폭 데이터 축적
-        if (close_p - future_low) > 0 and atr_p > 0:
-            mae_list.append((close_p - future_low) / atr_p)
-            
-        # 성공 사례(10일 내 수익 구간 발생) 시, 반등 첫날의 강도 측정
-        if future_max > close_p and atr_p > 0:
+        if (close_p - f_low) > 0 and atr_p > 0: 
+            mae_list.append((close_p - f_low) / atr_p)
+        if f_max > close_p and atr_p > 0: 
             reversal_strengths.append((close_p - low_p) / atr_p)
     
-    # 데이터 부족 시 방어
-    if len(mae_list) < 10 or len(reversal_strengths) < 5:
+    # 모수가 너무 적으면 통계적 의미가 없으므로 제외
+    if len(mae_list) < 10 or len(reversal_strengths) < 5: 
         return None, None, None
         
-    # [터틀 트레이딩 가드레일] 데이터 산출값과 2.0 ATR 중 큰 값 선택 (휩소 완벽 방어)
+    # 터틀 트레이딩 가드레일 (최소 2.0 ATR 손절폭 보장)
     opt_mult = max(np.percentile(mae_list, 90), 2.0) 
-    
     max_gap_threshold = np.percentile(historical_gaps, 80)
     min_reversal_factor = np.percentile(reversal_strengths, 25) 
     
     return opt_mult, max_gap_threshold, min_reversal_factor
 
 def calc_rs_score(df, spy_df):
-    """가중 누적 수익률을 활용한 개별 종목의 RS(상대강도) 점수 계산"""
+    """가중 누적 수익률을 활용한 상대강도(RS) 점수 산출"""
     try:
         periods = [63, 126, 189, 252]
-        weights = [0.4, 0.2, 0.2, 0.2] # 최근 3개월 탄력에 40% 가중치
+        weights = [0.4, 0.2, 0.2, 0.2]
         score = 0
-        
         for p, w in zip(periods, weights):
             if len(df) > p and len(spy_df) > p:
                 stock_ret = float(df['Close'].iloc[-1]) / float(df['Close'].iloc[-p])
                 spy_ret = float(spy_df['Close'].iloc[-1]) / float(spy_df['Close'].iloc[-p])
-                relative_ret = stock_ret / spy_ret 
-                score += relative_ret * w
+                score += (stock_ret / spy_ret) * w
         return score
-    except:
+    except: 
         return 0
 
+# --- [3. 유니버스 데이터 수집 함수] ---
 def fetch_wiki_tickers_safe(url):
-    """위키피디아 티커 수집 (S&P 500, Nasdaq 100)"""
+    """위키피디아에서 S&P 500, Nasdaq 100 티커 수집"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         res = requests.get(url, headers=headers, timeout=10)
@@ -110,7 +126,7 @@ def fetch_wiki_tickers_safe(url):
     return []
 
 def fetch_fallback_tickers():
-    """우회 루트 티커 수집"""
+    """위키피디아 수집 실패 시 우회 루트"""
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -129,41 +145,36 @@ def fetch_fallback_tickers():
     except: pass
     return tickers
 
+# --- [4. 메인 분석 로직] ---
 def analyze():
     start_date = "2023-01-01"
-    print(f"🚀 퀀트 스캔 시작: {datetime.now()}")
+    print(f"🚀 스캔 시작: {datetime.now()}")
     
-    # --- 🛑 [시장 3중 필터] SPY 추세 & VIX 변동성 체크 ---
+    # 1. 시장 필터 (SPY & VIX)
     print("시장 상태(SPY/VIX) 확인 중...")
-    spy_df = yf.download("SPY", start=start_date, progress=False)
-    vix_df = yf.download("^VIX", period="1mo", progress=False)
-    
-    if spy_df.empty or vix_df.empty:
+    m_data = yf.download(["SPY", "^VIX"], start=start_date, progress=False)['Close']
+    if m_data.empty:
         send_telegram("⚠️ <b>시장 데이터 로드 실패</b>\n지수 데이터를 가져오지 못해 스캔을 중단합니다.")
         return
         
-    if isinstance(spy_df.columns, pd.MultiIndex): spy_df.columns = spy_df.columns.get_level_values(0)
-    if isinstance(vix_df.columns, pd.MultiIndex): vix_df.columns = vix_df.columns.get_level_values(0)
+    spy = m_data['SPY'].dropna()
+    vix = m_data['^VIX'].dropna()
     
-    spy_df['MA200'] = ta.sma(spy_df['Close'], 200)
-    spy_df['MA5'] = ta.sma(spy_df['Close'], 5)
+    if len(spy) < 200: return
     
-    if len(spy_df) < 200: return
+    spy_ma200 = ta.sma(spy, 200)
+    spy_ma5 = ta.sma(spy, 5)
     
-    spy_curr = float(spy_df['Close'].iloc[-1])
-    spy_ma200 = float(spy_df['MA200'].iloc[-1])
-    spy_ma5 = float(spy_df['MA5'].iloc[-1])
-    vix_curr = float(vix_df['Close'].iloc[-1])
+    spy_curr = float(spy.iloc[-1])
+    vix_curr = float(vix.iloc[-1])
     
-    # [방어 로직] 200일선 위 (대세 상승) AND 5일선 위 (단기 추세) AND 공포지수 25 미만 (패닉장 회피)
-    market_is_safe = (spy_curr > spy_ma200) and (spy_curr > spy_ma5) and (vix_curr < 25)
-
-    if not market_is_safe:
-        send_telegram(f"⚠️ <b>시장 필터 작동 (현금 보호)</b>\nS&P 500 추세 이탈 또는 VIX 지수({vix_curr:.2f}) 급등으로 매수 스캔을 전면 중단합니다.")
+    # 200일선 위 & 5일선 위 & 공포지수 25 미만 조건 모두 충족해야 안전장으로 판단
+    if not (spy_curr > float(spy_ma200.iloc[-1]) and spy_curr > float(spy_ma5.iloc[-1]) and vix_curr < 25):
+        send_telegram(f"⚠️ <b>시장 필터 작동 (매수 중단)</b>\nS&P 500 추세 이탈 또는 VIX 지수({vix_curr:.2f}) 불안정으로 현금을 보호합니다.")
         return
 
-    # --- 1. 유니버스 구성 ---
-    print("종목 유니버스 구성 중...")
+    # 2. 티커 수집
+    print("유니버스 구성 중...")
     tickers = []
     for attempt in range(1, 4):
         sp500 = fetch_wiki_tickers_safe('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
@@ -172,137 +183,128 @@ def analyze():
         if len(tickers) > 400: break
         time.sleep(5)
         
-    if len(tickers) < 400: tickers = list(set(fetch_fallback_tickers()))
+    if len(tickers) < 400: 
+        tickers = list(set(fetch_fallback_tickers()))
+        
     tickers = [t.replace('.', '-') for t in tickers]
 
     if len(tickers) < 100:
-        send_telegram("⚠️ <b>데이터 수집 실패</b>\n명단 확보에 실패했습니다.")
+        send_telegram("⚠️ <b>데이터 수집 최종 실패</b>\n티커 명단 확보에 실패했습니다.")
         return
 
-    total_scan = len(tickers)
-    step1_pass, step2_pass, step3_pass, rs_pass, final_pass = 0, 0, 0, 0, 0
-    candidates_data, rs_scores = {}, {}
-
-    # --- 🚀 [속도 최적화] 대량 일괄 다운로드 ---
-    print(f"총 {total_scan}개 종목 일괄 다운로드 중... (약 1~2분 소요)")
+    # 3. 데이터 일괄 다운로드
+    print(f"총 {len(tickers)}개 종목 일괄 다운로드 중...")
     raw_data = yf.download(tickers, start=start_date, group_by='ticker', threads=True, progress=False)
 
+    rs_scores_global = {}
+
+    # [1차 패스] 전체 유니버스 대상 RS 랭킹 산출
+    print("1차 패스: 전체 유니버스 RS 점수 계산 중...")
     for ticker in tickers:
         try:
             if isinstance(raw_data.columns, pd.MultiIndex):
                 if ticker not in raw_data.columns.get_level_values(0): continue
                 df = raw_data[ticker].copy()
-            else: df = raw_data.copy()
-            
+            else:
+                df = raw_data.copy()
+                
             df.dropna(inplace=True)
-            if df.empty or len(df) < 260: continue
-
+            if len(df) < 260: continue
+            
             cp = float(df['Close'].iloc[-1])
-            cv = float(df['Volume'].iloc[-1])
             avg_v20 = float(df['Volume'].rolling(20).mean().iloc[-1])
-
-            # [1단계] 유동성 필터 (가격 상한선 300불 제한 철폐, 동전주만 컷)
+            
+            # 동전주 컷 & 유동성 필터
             if cp < 10 or (cp * avg_v20 < 20000000): continue
-            step1_pass += 1
-
-            # 기술적 지표
-            df['MA20'], df['MA50'], df['MA200'] = ta.sma(df['Close'], 20), ta.sma(df['Close'], 50), ta.sma(df['Close'], 200)
-            df['BB_MID'] = ta.bbands(df['Close'], 20, 2.0)['BBM_20_2.0']
-            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
-            rsi_val = float(ta.rsi(df['Close'], 14).iloc[-1])
-            current_atr = float(df['ATR'].iloc[-1])
-
-            # 🛑 [2단계] 종목 장/중기 추세 필터 (주도주는 200일, 50일선 위에 존재)
-            if cp < float(df['MA200'].iloc[-1]) or cp < float(df['MA50'].iloc[-1]): continue
-            step2_pass += 1
-
-            # [3단계] 수급 진공 & 찐반등(망치형) 트리거
-            # 3-1. 수급 조건: 어제보다 거래량이 늘었으나, 비정상적 광기(평균 3배 초과)는 아닐 것 & RSI 30 이상
-            is_volume_ok = (cv > float(df['Volume'].iloc[-2])) and (cv < avg_v20 * 3.0)
-            if not is_volume_ok or rsi_val < 30: continue
             
-            # 3-2. 구역(Zone) 조건
-            is_uptrend = float(df['MA20'].iloc[-1]) > float(df['MA50'].iloc[-1])
-            is_in_pullback = cp <= float(df['BB_MID'].iloc[-1])
+            df['MA200'] = ta.sma(df['Close'], 200)
+            df['MA50'] = ta.sma(df['Close'], 50)
             
-            # 3-3. 반등 트리거: 양봉 & 꼬리 말아올림(해머형 캔들 등 종가가 상단 40% 이내 안착)
-            candle_range = float(df['High'].iloc[-1]) - float(df['Low'].iloc[-1])
-            reversal_pos = (cp - float(df['Low'].iloc[-1])) / candle_range if candle_range > 0 else 0
-            
-            is_green_candle = cp > float(df['Open'].iloc[-1])
-            is_strong_close = reversal_pos >= 0.6 # 종가가 고가에 가깝게 강하게 마감되었는지 확인
-            
-            # 백테스트 기록용 (Zone 진입 기준)
-            df['Buy_Signal_Historical'] = (df['MA20'] > df['MA50']) & (df['Close'] <= df['BB_MID'])
-            
-            if is_uptrend and is_in_pullback and is_green_candle and is_strong_close:
-                step3_pass += 1
-                score = calc_rs_score(df, spy_df)
+            # 주도주 기본 조건: 가격이 200일선과 50일선 위에 있어야 함
+            if cp > float(df['MA200'].iloc[-1]) and cp > float(df['MA50'].iloc[-1]):
+                score = calc_rs_score(df, spy)
                 if score > 0:
-                    rs_scores[ticker] = score
-                    candidates_data[ticker] = {'df': df, 'cp': cp, 'atr': current_atr, 'low': float(df['Low'].iloc[-1])}
-        except Exception as e:
+                    rs_scores_global[ticker] = score
+        except Exception:
             continue
 
-    # --- 🎯 [4단계] RS 랭킹 산출 및 데이터 검증 ---
+    if not rs_scores_global:
+        send_telegram("⚠️ <b>조건을 충족하는 종목이 없어 스캔을 종료합니다.</b>")
+        return
+
+    # RS 점수를 바탕으로 상위 20% 주도주 명단 추출
+    rs_ranks = pd.Series(rs_scores_global).rank(pct=True) * 100
+    leading_stocks = rs_ranks[rs_ranks >= 80].index.tolist()
+
+    # [2차 패스] 상위 20% 주도주 안에서 타점 검사
+    print(f"2차 패스: 상위 20% 주도주({len(leading_stocks)}개) 타점 스캔 중...")
     msg_list = []
-    if rs_scores:
-        rs_series = pd.Series(rs_scores)
-        rs_ranks = rs_series.rank(pct=True) * 100 
-        
-        for ticker, rank in rs_ranks.items():
-            if rank >= 80: # 상위 20% 주도주
-                rs_pass += 1
-                data = candidates_data[ticker]
-                df, cp, atr, low = data['df'], data['cp'], data['atr'], data['low']
-                
+    final_pass_count = 0
+
+    for ticker in leading_stocks:
+        try:
+            df = raw_data[ticker].dropna()
+            df['MA20'] = ta.sma(df['Close'], 20)
+            df['MA50'] = ta.sma(df['Close'], 50)
+            df['BB_MID'] = ta.bbands(df['Close'], 20, 2.0)['BBM_20_2.0']
+            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
+            
+            cp = float(df['Close'].iloc[-1])
+            cv = float(df['Volume'].iloc[-1])
+            prev_v = float(df['Volume'].iloc[-2])
+            avg_v20 = float(df['Volume'].rolling(20).mean().iloc[-1])
+            
+            # 조건 1. 구역(Zone)
+            is_zone = float(df['MA20'].iloc[-1]) > float(df['MA50'].iloc[-1]) and cp <= float(df['BB_MID'].iloc[-1])
+            
+            # 조건 2. 수급(Volume) - 어제보다 증가하되 평균 3배 이내의 이성적 반등
+            is_vol_ok = (cv > prev_v) and (cv < avg_v20 * 3.0)
+            
+            # 조건 3. 캔들(Hammer) 트리거 - 양봉 & 종가가 전체 캔들의 60% 이상 상단에 마감
+            c_range = float(df['High'].iloc[-1]) - float(df['Low'].iloc[-1])
+            rev_pos = (cp - float(df['Low'].iloc[-1])) / c_range if c_range > 0 else 0
+            is_trigger = cp > float(df['Open'].iloc[-1]) and rev_pos >= 0.6
+            
+            if is_zone and is_vol_ok and is_trigger:
+                # 과거 데이터 검증 및 손절/목표가 수치 산출
                 opt_mult, max_gap_limit, min_rev_factor = get_optimal_metrics(df)
                 if opt_mult is None: continue
                 
-                # 종목별 맞춤형 반등 강도 확인
-                current_rev_strength = (cp - low) / atr
+                # 현재 반등 강도가 과거 통과 기준을 넘었는지 확인
+                curr_rev_strength = (cp - float(df['Low'].iloc[-1])) / float(df['ATR'].iloc[-1])
                 
-                if current_rev_strength >= min_rev_factor:
-                    final_pass += 1
-                    cnt_total = int(df['Buy_Signal_Historical'].sum())
-
-                    # 리스크 산출 (고정 $200 리스크 기준)
-                    stop_l = cp - (opt_mult * atr)
+                if curr_rev_strength >= min_rev_factor:
+                    final_pass_count += 1
+                    
+                    stop_l = cp - (opt_mult * float(df['ATR'].iloc[-1]))
                     qty = int(200 // (cp - stop_l)) if cp > stop_l else 0
                     
                     entry_limit_p = cp * (1 + max_gap_limit / 100)
-                    limit_stop_l = entry_limit_p - (opt_mult * atr)
+                    limit_stop_l = entry_limit_p - (opt_mult * float(df['ATR'].iloc[-1]))
 
                     msg_list.append(
-                        f"🚀 <b>[매수 포착] {ticker}</b> (RS Rank: <b>{rank:.1f}</b>)\n"
-                        f"- 과거기회 : 총 {cnt_total}회 (23년~)\n"
-                        f"- ATR : <b>${atr:.2f}</b>\n"
+                        f"🚀 <b>[매수 포착] {ticker}</b> (RS Rank: <b>{rs_ranks[ticker]:.1f}</b>)\n"
+                        f"- ATR : <b>${float(df['ATR'].iloc[-1]):.2f}</b>\n"
                         f"\n"
                         f"- 현재가 : ${cp:.2f}\n"
                         f"- <b>진입 제한가 : ${entry_limit_p:.2f} (갭 {max_gap_limit:.1f}% 이내)</b>\n"
                         f"\n"
-                        f"- 현재가 진입시, 손절가 : ${stop_l:.2f} (ATR x {opt_mult:.2f}배)\n"
-                        f"- 제한가 진입시, 손절가 : <b>${limit_stop_l:.2f}</b>\n"
+                        f"- 현재가 진입시 손절가 : ${stop_l:.2f} (ATR x {opt_mult:.2f}배)\n"
+                        f"- 제한가 진입시 손절가 : <b>${limit_stop_l:.2f}</b>\n"
                         f"\n"
                         f"- 추천수량 : <b>{qty}주</b>\n"
-                        f"💡 <i>반등강도: {current_rev_strength:.2f} (최소기준 {min_rev_factor:.2f} 통과)</i>\n"
+                        f"💡 <i>반등강도: {curr_rev_strength:.2f} (최소기준 {min_rev_factor:.2f} 통과)</i>\n"
                     )
+        except Exception:
+            continue
 
-    # --- 텔레그램 발송 ---
-    header = f"<b>📅 {datetime.now().date()} 퀀트 스캔 보고서</b>\n\n"
-    body = "\n".join(msg_list) if final_pass > 0 else "❌ <b>오늘은 '찐반등 트리거'가 작동한 1급(RS 80+) 주도주가 없습니다.</b>\n"
+    # 4. 분할 발송 로직 실행
+    header = f"<b>📅 {datetime.now().date()} 퀀트 보고서 (PRO-MASTER)</b>\n\n"
+    footer = f"\n<b>[진단 결과]</b>\n스캔:{len(tickers)}개 / 주도주(RS 80+):{len(leading_stocks)}개 / 최종 타점:{final_pass_count}개"
     
-    footer = (f"\n<b>[진단 결과]</b>\n"
-              f"* 총 스캔 종목: {total_scan}개\n"
-              f"* 유동성 필터 통과: {step1_pass}개\n"
-              f"* 추세(50/200일선) 통과: {step2_pass}개\n"
-              f"* 타점(Zone/망치형 캔들/수급) 통과: {step3_pass}개\n"
-              f"* RS 80+ 주도주 랭킹 통과: {rs_pass}개\n"
-              f"* <b>최종(데이터 검증 & 찐반등 강도): {final_pass}개</b>")
-    
-    send_telegram(header + body + footer)
+    send_telegram_chunks(msg_list, header, footer)
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
     print("🚀 PRO 버전 퀀트 스캐너 가동을 시작합니다...")
     analyze()
     print("✅ 스캔 및 알림 프로세스가 정상 종료되었습니다.")
