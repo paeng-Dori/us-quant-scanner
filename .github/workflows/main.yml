@@ -2,26 +2,23 @@ name: US-Quant-Auto-Scanner
 
 on:
   schedule:
-    # KST 06:58 실행
-    # UTC 21:58 (한국 -9시간)
+    # 한국 시간(KST) 기준 월요일 아침 6:58 ~ 토요일 아침 6:58
+    # UTC 기준 일요일(0) 21:58 ~ 금요일(5) 21:58
     - cron: '58 21 * * 0-5'
     
-  workflow_dispatch:
+  workflow_dispatch: # 필요할 때 언제든 버튼 눌러서 수동 실행 가능
 
 jobs:
   run-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
-          
       - name: Install Libs
         run: pip install yfinance pandas pandas_ta requests lxml
-        
       - name: Run Script
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
