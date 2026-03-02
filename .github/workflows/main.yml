@@ -2,9 +2,13 @@ name: US-Quant-Auto-Scanner
 
 on:
   schedule:
+    # 한국 시간(KST) 기준 월~토 아침 06:58 실행 (미국 시장 마감 직후)
+    # UTC 기준 일~금 21:58
     - cron: '58 21 * * 0-5'
-  workflow_dispatch:
+    
+  workflow_dispatch: # 필요할 때 언제든 버튼 눌러서 수동 실행 가능
 
+# 깃허브 액션 봇에게 파일 쓰기 권한 부여
 permissions:
   contents: write
 
@@ -12,37 +16,44 @@ jobs:
   run-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v3
         with:
-          fetch-depth: 0 # [보완] 충돌 해결을 위해 전체 이력 필요
-
+          # [보완] rebase 충돌 방지를 위해 전체 커밋 이력을 가져옵니다.
+          fetch-depth: 0 
+          
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
-          cache: 'pip' # [보완] 라이브러리 캐싱으로 속도 향상
-
-      - name: Install Libs
+          # [보완] 라이브러리 캐싱 적용 (매일 설치하는 시간 1분 이상 단축)
+          cache: 'pip'
+          
+      - name: Install Dependencies
         run: |
+          python -m pip install --upgrade pip
+          # [보완] 타임존 처리를 위한 pytz 및 고속 파싱을 위한 lxml 포함
           pip install yfinance pandas pandas_ta numpy requests lxml pytz
-
-      - name: Run Script
+          
+      - name: Run Quant Scanner
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
 
-      - name: Commit and push state files
+      - name: Commit and Push Changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # [보완] 새로 생긴 sector_cache.json도 관리 대상에 포함
+          # [보완] 신규 sector_cache.json 및 모든 로그성 json, txt 파일 포함
           git add *.json *.txt
           
+          # 변경사항이 있을 때만 커밋 및 푸시 수행
           if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "📈 자동 업데이트: 포지션 및 섹터 캐시 갱신"
-            # [보완] 푸시 전 서버의 최신 상태와 합치기 (충돌 방지 핵심)
+            git commit -m "📈 자동 업데이트: 5년 데이터 기반 스캔 결과 및 섹터 캐시 갱신"
+            
+            # [보완] 핵심: 푸시 전 최신 상태를 가져와 합침으로써 사용자 수동 수정과 충돌 방지
             git pull --rebase origin main
             git push origin main
           else
