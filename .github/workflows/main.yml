@@ -42,19 +42,24 @@ jobs:
 
       - name: Commit and push state files (json/txt)
         run: |
+          # ✅ exit 128 주요 원인(소유권/브랜치/DETACHED HEAD) 방지
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git pull --rebase
+          BRANCH="${GITHUB_REF_NAME}"
 
-          # ✅ 글롭 매칭 실패 방지 + 변경분 전체 반영
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+          git pull --rebase origin "$BRANCH"
+
           git add -A
 
-          # 변경사항 없으면 커밋 스킵
           if git diff --cached --quiet; then
             echo "No state changes to commit."
             exit 0
           fi
 
           git commit -m "Update state files (auto)"
-          git push
+          git push origin "HEAD:$BRANCH"
