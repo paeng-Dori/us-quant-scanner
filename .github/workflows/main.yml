@@ -2,8 +2,14 @@ name: US-Quant-Auto-Scanner
 
 on:
   schedule:
-    - cron: '58 21 * * 0-5'
+    # KST 월~토 06:58  → UTC 일~금 21:58
+    - cron: "58 21 * * 0-5"
   workflow_dispatch:
+
+# ✅ 동시 실행 방지 (상태파일 꼬임 방지)
+concurrency:
+  group: us-quant-auto-scanner
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -12,20 +18,21 @@ jobs:
   run-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0 
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          # 에러를 일으킨 cache: 'pip' 옵션 삭제 완료!
+          python-version: "3.12"
 
       - name: Install Libs
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas pandas_ta numpy requests lxml pytz
+          pip install yfinance pandas pandas_ta requests lxml
 
       - name: Run Script
         env:
@@ -33,17 +40,21 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
 
-      - name: Commit and push state files
+      - name: Commit and push state files (json/txt)
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add *.json *.txt
-          
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "📈 자동 업데이트: 5년 데이터 기반 스캔 결과 및 섹터 캐시 갱신"
-            git pull --rebase origin main
-            git push origin main
-          else
-            echo "No changes to commit"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase
+
+          # ✅ 글롭 매칭 실패 방지 + 변경분 전체 반영
+          git add -A
+
+          # 변경사항 없으면 커밋 스킵
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
           fi
+
+          git commit -m "Update state files (auto)"
+          git push
