@@ -2,11 +2,9 @@ name: US-Quant-Auto-Scanner
 
 on:
   schedule:
-    # KST 월~토 06:58  → UTC 일~금 21:58
     - cron: "58 21 * * 0-5"
   workflow_dispatch:
 
-# ✅ 동시 실행 방지 (상태파일 꼬임 방지)
 concurrency:
   group: us-quant-auto-scanner
   cancel-in-progress: false
@@ -17,11 +15,11 @@ permissions:
 jobs:
   run-scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           persist-credentials: true
 
       - name: Setup Python
@@ -40,28 +38,17 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
 
-      - name: Commit and push state files (json/txt)
+      - name: Commit state changes
         run: |
-          set -e
-
-          # ✅ exit 128 주요 원인(소유권/브랜치 꼬임/rebase 충돌) 방지
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          BRANCH="${GITHUB_REF_NAME}"
-
-          # ✅ 항상 원격 최신 상태로 맞춘 다음 상태파일만 커밋 (pull/rebase 제거)
-          git fetch origin "$BRANCH"
-          git checkout "$BRANCH"
-          git reset --hard "origin/$BRANCH"
 
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No state changes to commit."
+            echo "No changes to commit"
             exit 0
           fi
 
-          git commit -m "Update state files (auto)"
-          git push origin "HEAD:$BRANCH"
+          git commit -m "Auto update state files"
+          git push
