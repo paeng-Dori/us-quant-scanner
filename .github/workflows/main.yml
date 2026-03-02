@@ -2,13 +2,9 @@ name: US-Quant-Auto-Scanner
 
 on:
   schedule:
-    # 한국 시간(KST) 기준 월요일 아침 6:58 ~ 토요일 아침 6:58
-    # UTC 기준 일요일(0) 21:58 ~ 금요일(5) 21:58
     - cron: '58 21 * * 0-5'
-    
-  workflow_dispatch: # 필요할 때 언제든 버튼 눌러서 수동 실행 가능
+  workflow_dispatch:
 
-# ✅ 깃허브 액션 봇이 파일(장부)을 수정하고 덮어쓸 수 있도록 '쓰기 권한' 부여
 permissions:
   contents: write
 
@@ -17,29 +13,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+        with:
+          fetch-depth: 0 # [보완] 충돌 해결을 위해 전체 이력 필요
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
-          
+          cache: 'pip' # [보완] 라이브러리 캐싱으로 속도 향상
+
       - name: Install Libs
-        # 📌 의존성 에러 방지를 위해 numpy 명시적 추가
-        run: pip install yfinance pandas pandas_ta numpy requests lxml
-        
+        run: |
+          pip install yfinance pandas pandas_ta numpy requests lxml pytz
+
       - name: Run Script
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
 
-      # ✅ [핵심] 봇이 오늘 업데이트한 장부(.json) 및 위키피디아 캐시(.txt) 영구 저장!
       - name: Commit and push state files
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          # 📌 캐시 파일도 깃허브에 저장되도록 *.txt 추가
+          
+          # [보완] 새로 생긴 sector_cache.json도 관리 대상에 포함
           git add *.json *.txt
-          # 변경된 파일이 있을 때만 커밋(저장)하고 푸시(업로드)해라
-          git diff-index --quiet HEAD || git commit -m "📈 자동 업데이트: 포지션, 주문 상태 및 티커 캐시 갱신"
-          git push
+          
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "📈 자동 업데이트: 포지션 및 섹터 캐시 갱신"
+            # [보완] 푸시 전 서버의 최신 상태와 합치기 (충돌 방지 핵심)
+            git pull --rebase origin main
+            git push origin main
+          else
+            echo "No changes to commit"
+          fi
