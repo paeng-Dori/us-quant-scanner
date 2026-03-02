@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "ticker": "NVDA",
+    "fill_date": "2026-03-02",
+    "fill_price": 105.55
+  }
+]
