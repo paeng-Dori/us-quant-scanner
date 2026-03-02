@@ -8,19 +8,36 @@ on:
     
   workflow_dispatch: # 필요할 때 언제든 버튼 눌러서 수동 실행 가능
 
+# ✅ 깃허브 액션 봇이 파일(장부)을 수정하고 덮어쓸 수 있도록 '쓰기 권한' 부여
+permissions:
+  contents: write
+
 jobs:
   run-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
+          
       - name: Install Libs
         run: pip install yfinance pandas pandas_ta requests lxml
+        
       - name: Run Script
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
+
+      # ✅ [핵심] 봇이 오늘 업데이트한 장부(.json)를 영구 저장!
+      - name: Commit and push state files
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add *.json
+          # 변경된 파일이 있을 때만 커밋(저장)하고 푸시(업로드)해라
+          git diff-index --quiet HEAD || git commit -m "📈 자동 업데이트: 포지션 및 주문 상태 갱신"
+          git push
