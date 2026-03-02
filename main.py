@@ -39,7 +39,6 @@ OPT_MULT_MAX = 5.0               # 변동성에 맞춰 넉넉하게 스탑로스
 MIN_MAE_SAMPLES = 10
 MIN_REV_SAMPLES = 5
 
-# ✅ 신규: 샘플 기반 진입 제외/방어 규칙
 MIN_SAMPLE_ENTRY = 5             # 샘플 5건 미만은 진입 제외
 SAMPLE_DEFENSE_MAX = 9           # 샘플 5~9는 방어모드(샘플 부족)
 
@@ -50,6 +49,9 @@ FOMC_DATES = [
     "2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17",
     "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16"
 ]
+
+# 위키피디아 스크래핑 실패 시 최후의 보루 (에러 방지용)
+FALLBACK_TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AVGO", "TSLA", "COST", "NFLX"]
 
 # =========================
 # [2. 상태 파일 (실전 포지션 관리 및 월간 캐싱)]
@@ -141,7 +143,6 @@ def process_telegram_commands():
             msg = item.get("message", {})
             text = msg.get("text", "").strip()
 
-            # ✅ 1. "매수" 명령어 처리 (장부 등록 및 감시 시작)
             if text.startswith("매수"):
                 parts = text.split()
                 if len(parts) >= 3:
@@ -161,7 +162,6 @@ def process_telegram_commands():
                     except:
                         pass
             
-            # ✅ 2. "1차매도" 명령어 처리 (수동 절반 익절 컨펌)
             elif text.startswith("1차매도"):
                 parts = text.split()
                 if len(parts) >= 2:
@@ -184,7 +184,6 @@ def process_telegram_commands():
                     else:
                         send_telegram(f"⚠️ <b>[오류]</b> {ticker} 종목은 현재 보유 장부에 없습니다.")
             
-            # ✅ 3. "매도" 명령어 처리 (장부 전량 삭제 및 슬롯 확보)
             elif text.startswith("매도"):
                 parts = text.split()
                 if len(parts) >= 2:
@@ -251,7 +250,8 @@ def wiki_tickers_sp500():
         save_cache(CACHE_SP, syms)
         return syms
     except:
-        return load_cache(CACHE_SP) or []
+        cached = load_cache(CACHE_SP)
+        return cached if cached else FALLBACK_TICKERS
 
 def wiki_tickers_nasdaq100():
     url = "https://en.wikipedia.org/wiki/Nasdaq-100"
@@ -264,7 +264,8 @@ def wiki_tickers_nasdaq100():
         save_cache(CACHE_NQ, syms)
         return syms
     except:
-        return load_cache(CACHE_NQ) or []
+        cached = load_cache(CACHE_NQ)
+        return cached if cached else FALLBACK_TICKERS
 
 def build_universe_backtest_style():
     sp = [normalize_ticker(s) for s in wiki_tickers_sp500()]
@@ -315,9 +316,11 @@ def get_fomc_warning() -> str:
     return ""
 
 # =========================
-# [5. yfinance 청크 다운로드 및 전처리]
+# [5. yfinance 청크 다운로드 및 전처리 (안정성 강화)]
 # =========================
 def _ensure_multiindex(one_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if one_df is None or one_df.empty:
+        return pd.DataFrame()
     if isinstance(one_df.columns, pd.MultiIndex):
         return one_df
     one_df = one_df.copy()
@@ -336,8 +339,15 @@ def download_price_data_chunked(tickers, start_date, chunk_size=100, pause=1.2):
                 group_by='ticker', threads=True,
                 progress=False, auto_adjust=True
             )
+            
+            if df is None or df.empty:
+                continue
+
             if len(chunk) == 1:
                 df = _ensure_multiindex(df, chunk[0])
+            elif not isinstance(df.columns, pd.MultiIndex):
+                continue
+                
             all_parts.append(df)
         except:
             pass
@@ -346,8 +356,11 @@ def download_price_data_chunked(tickers, start_date, chunk_size=100, pause=1.2):
     if not all_parts:
         return pd.DataFrame()
 
-    merged = pd.concat(all_parts, axis=1)
-    return merged.loc[:, ~merged.columns.duplicated(keep='last')]
+    try:
+        merged = pd.concat(all_parts, axis=1)
+        return merged.loc[:, ~merged.columns.duplicated(keep='last')]
+    except:
+        return pd.DataFrame()
 
 def sanitize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -511,7 +524,7 @@ def apply_fills_to_positions(pending: dict, positions: dict):
 
             "sl_alerted": False,
             "trail_alerted": False,
-            "tp2_alerted": False  # 목표가 도달 알림 중복 방지용
+            "tp2_alerted": False  
         }
 
         pending.pop(ticker, None)
@@ -525,7 +538,7 @@ def apply_fills_to_positions(pending: dict, positions: dict):
     if new_fills_msgs:
         send_telegram_chunks(new_fills_msgs, f"<b>📌 {datetime.now().date()} 체결확정 반영</b>\n\n", "")
 
-    _save_json(FILLS_PATH, [])  # 처리된 fills 비우기(중복 반영 방지)
+    _save_json(FILLS_PATH, [])  
     return pending, positions
 
 def evaluate_exits_and_alert(positions: dict, raw_data: pd.DataFrame):
@@ -552,7 +565,6 @@ def evaluate_exits_and_alert(positions: dict, raw_data: pd.DataFrame):
             sl_price = float(pos.get("sl_price", 0))
             tp2_price = float(pos.get("tp2_price", 0))
 
-            # ✅ 오늘의 2차 매도(TRAIL) 선 계산 및 장부에 저장 (대시보드 표시용)
             ema20 = float(df["EMA20"].iloc[-1])
             atr_now = float(df["ATR"].iloc[-1])
             trail_line = 0
@@ -560,7 +572,6 @@ def evaluate_exits_and_alert(positions: dict, raw_data: pd.DataFrame):
                 trail_line = ema20 - float(TRAIL_MULT) * atr_now
                 pos["current_trail"] = trail_line
 
-            # 1) SL 경고 (이탈 확인)
             if sl_price > 0 and day_low <= sl_price and not pos.get("sl_alerted"):
                 alerts.append(
                     f"🛑 <b>[손절가(SL) 이탈] {ticker}</b>\n"
@@ -569,7 +580,6 @@ def evaluate_exits_and_alert(positions: dict, raw_data: pd.DataFrame):
                 )
                 pos["sl_alerted"] = True
 
-            # 2) 1차 익절(2R) 도달 알림 (수동 매도를 위한 푸시)
             if (not pos.get("sold_partial")) and tp2_price > 0 and day_high >= tp2_price:
                 if not pos.get("tp2_alerted"):
                     alerts.append(
@@ -580,7 +590,6 @@ def evaluate_exits_and_alert(positions: dict, raw_data: pd.DataFrame):
                     )
                     pos["tp2_alerted"] = True
 
-            # 3) 트레일 신호 이탈
             if trail_line > 0:
                 if day_close < trail_line and not pos.get("trail_alerted"):
                     alerts.append(
@@ -607,7 +616,6 @@ def analyze():
     start_date = (pd.Timestamp.now() - pd.DateOffset(years=5)).strftime('%Y-%m-%d')
     print(f"데이터 수집 기준일: {start_date} (5년치)")
 
-    # 시장 데이터
     try:
         m_raw = yf.download(["SPY", "^VIX"], start=start_date, progress=False, auto_adjust=True)
         m_close = m_raw["Close"] if isinstance(m_raw.columns, pd.MultiIndex) else m_raw["Close"]
@@ -623,7 +631,6 @@ def analyze():
     spy_ma200 = float(ta.sma(spy, 200).iloc[-1])
     spy_ma5 = float(ta.sma(spy, 5).iloc[-1])
 
-    # 시장 필터
     if not (spy_curr > spy_ma200 and spy_curr > spy_ma5 and vix_curr < VIX_MAX):
         return send_telegram(
             f"⚠️ <b>시장 필터 작동 (매수 중단)</b>\n"
@@ -640,7 +647,6 @@ def analyze():
     if raw_data.empty:
         return send_telegram("⚠️ 가격 데이터 다운로드 실패")
 
-    # 상태 로드/정리
     pending = expire_pending_orders(load_pending_orders())
     positions = load_positions()
 
@@ -650,14 +656,12 @@ def analyze():
     save_pending_orders(pending)
     save_positions(positions)
 
-    # 월간 캐시
     monthly_metrics = load_monthly_metrics()
     current_month = datetime.now().strftime("%Y-%m")
     if monthly_metrics.get("month") != current_month:
         print(f"🔄 월 변경 감지({current_month}). 메트릭 캐시를 초기화합니다.")
         monthly_metrics = {"month": current_month, "metrics": {}}
 
-    # RS 랭킹 계산
     print("RS 랭킹 계산 중 (벡터 연산)...")
     close_all = pd.DataFrame(index=spy.index)
 
@@ -715,30 +719,22 @@ def analyze():
             if not np.isfinite(atr_val) or atr_val <= 0 or cp <= 0:
                 continue
 
-            # 거래량 조건
             cond_inc = cv > prev_v
             cond_exc = (prev_v > avg_v20 * 1.5) and (cv > avg_v20)
             if not ((cond_inc or cond_exc) and cv < avg_v20 * VOLUME_OVERHEAT_MULT):
                 continue
 
-            # 추세 + 눌림 조건
             if not (float(row["MA20"]) > float(row["MA50"]) and cp > float(row["MA200"]) and cp <= float(row["EMA20"])):
                 continue
 
-            # 캔들 반등 조건
             c_range = float(row["High"]) - float(row["Low"])
             rev_pos = (cp - float(row["Low"])) / c_range if c_range > 0 else 0
             if not (cp > float(row["Open"]) and rev_pos >= 0.6):
                 continue
 
-            earnings_msg = get_earnings_warning_cached(ticker)
-
-            # 섹터 분산 제한
-            sector = get_sector_cached(ticker)
-            if sector != "Unknown" and sector_counts.get(sector, 0) >= MAX_PER_SECTOR:
-                continue
-
-            # 메트릭 캐시 로드/계산
+            # ==========================================
+            # ✅ 메트릭 캐시를 먼저 확인/계산 (API 호출 전 필터링)
+            # ==========================================
             if ticker in monthly_metrics["metrics"]:
                 cached = monthly_metrics["metrics"][ticker]
                 opt_mult = float(cached.get("opt_mult", OPT_MULT_MIN))
@@ -762,6 +758,15 @@ def analyze():
             if (cp - float(row["Low"])) / atr_val < float(min_rev_factor):
                 continue
 
+            # ==========================================
+            # ✅ 끝까지 통과한 종목에 대해서만 API 정보 수집 (병목 방지)
+            # ==========================================
+            sector = get_sector_cached(ticker)
+            if sector != "Unknown" and sector_counts.get(sector, 0) >= MAX_PER_SECTOR:
+                continue
+
+            earnings_msg = get_earnings_warning_cached(ticker)
+
             if sample_count <= SAMPLE_DEFENSE_MAX:
                 mode_msg = f"🛡️ 방어모드 : ATR {opt_mult:.2f}배 적용 (샘플 {sample_count}건, 샘플 데이터 부족)"
                 is_defense = True
@@ -772,12 +777,10 @@ def analyze():
                 mode_msg = f"🧠 동적모드 : ATR {opt_mult:.2f}배 적용 (샘플 {sample_count}건)"
                 is_defense = False
 
-            # 스탑 거리 & 수량 계산
             stop_dist = atr_val * opt_mult
             if stop_dist <= 0:
                 continue
 
-            # 진입 제한가(갭 상단)
             entry_limit_p = cp * (1 + max_gap_limit / 100.0)
 
             qty_risk = int(RISK_AMOUNT // stop_dist)
@@ -790,7 +793,6 @@ def analyze():
             sl_price = entry_limit_p - stop_dist
             tp2_price = entry_limit_p + (PARTIAL_TP_R * stop_dist)
 
-            # 상태 업데이트
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
             final_pass_count += 1
             total_risk_used += RISK_AMOUNT
@@ -824,7 +826,6 @@ def analyze():
     save_pending_orders(pending)
     save_monthly_metrics(monthly_metrics)
 
-    # ✅ 매일 아침 보유 포지션 상태를 브리핑(대시보드)으로 생성
     pos_summary = "\n━━━━━━━━━━━━━━━━━━\n<b>[📊 현재 보유 포지션 대시보드]</b>\n"
     if positions:
         for t, p in positions.items():
@@ -833,7 +834,6 @@ def analyze():
             trail = p.get("current_trail", 0)
             sl = p.get("sl_price", 0)
             
-            # 1차 매도(절반 익절)를 이미 했다면 체크 표시
             status_1r = "✅ 완료" if p.get("sold_partial") else f"${tp2:.2f}"
             
             pos_summary += (
