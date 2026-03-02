@@ -24,7 +24,8 @@ jobs:
           python-version: '3.12'
           
       - name: Install Libs
-        run: pip install yfinance pandas pandas_ta requests lxml
+        # 📌 의존성 에러 방지를 위해 numpy 명시적 추가
+        run: pip install yfinance pandas pandas_ta numpy requests lxml
         
       - name: Run Script
         env:
@@ -32,12 +33,13 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
 
-      # ✅ [핵심] 봇이 오늘 업데이트한 장부(.json)를 영구 저장!
+      # ✅ [핵심] 봇이 오늘 업데이트한 장부(.json) 및 위키피디아 캐시(.txt) 영구 저장!
       - name: Commit and push state files
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add *.json
+          # 📌 캐시 파일도 깃허브에 저장되도록 *.txt 추가
+          git add *.json *.txt
           # 변경된 파일이 있을 때만 커밋(저장)하고 푸시(업로드)해라
-          git diff-index --quiet HEAD || git commit -m "📈 자동 업데이트: 포지션 및 주문 상태 갱신"
+          git diff-index --quiet HEAD || git commit -m "📈 자동 업데이트: 포지션, 주문 상태 및 티커 캐시 갱신"
           git push
