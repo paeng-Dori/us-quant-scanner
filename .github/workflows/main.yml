@@ -42,17 +42,19 @@ jobs:
 
       - name: Commit and push state files (json/txt)
         run: |
-          # ✅ exit 128 주요 원인(소유권/브랜치/DETACHED HEAD) 방지
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          set -e
 
+          # ✅ exit 128 주요 원인(소유권/브랜치 꼬임/rebase 충돌) 방지
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           BRANCH="${GITHUB_REF_NAME}"
 
+          # ✅ 항상 원격 최신 상태로 맞춘 다음 상태파일만 커밋 (pull/rebase 제거)
           git fetch origin "$BRANCH"
           git checkout "$BRANCH"
-          git pull --rebase origin "$BRANCH"
+          git reset --hard "origin/$BRANCH"
 
           git add -A
 
