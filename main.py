@@ -79,43 +79,119 @@ BOT_TOKEN = os.environ.get('TG_TOKEN')
 CHAT_ID = os.environ.get('TG_CHAT_ID')
 
 def send_telegram(message: str):
+    """
+    [운영 보강]
+    - 전송 실패 침묵 방지(콘솔 로그)
+    - HTTP/status ok 체크
+    - 가벼운 재시도
+    ※ 메시지 문구/내용은 호출부에서 그대로 유지
+    """
     if not BOT_TOKEN or not CHAT_ID:
         print(message)
         return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=data, timeout=10)
-    except:
-        pass
+    data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(url, data=data, timeout=15)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                time.sleep(1 + attempt)
+                continue
+            j = r.json()
+            if not j.get("ok", False):
+                last_err = f"TG not ok: {str(j)[:200]}"
+                time.sleep(1 + attempt)
+                continue
+            return
+        except Exception as e:
+            last_err = repr(e)
+            time.sleep(1 + attempt)
+
+    print(f"[TG SEND FAIL] {last_err}")
+
 
 def send_telegram_chunks(msg_list, header, footer):
+    """
+    [운영 보강]
+    - 텔레그램 메시지 길이 제한(4096) 회피를 위해 문자수 기반 분할
+    - 기존 타이틀 포맷 '(파트 n)' 유지
+    - footer는 마지막 파트에만 붙이기(기존 동작 유지)
+    - msg_list 비었을 때 문구 유지
+    """
     if not msg_list:
         send_telegram(header + "❌ <b>오늘은 조건에 맞는 1급 주도주가 없습니다.</b>\n" + footer)
         return
-    chunk_size = 5
-    for i in range(0, len(msg_list), chunk_size):
-        chunk = msg_list[i:i + chunk_size]
-        body = "\n".join(chunk)
-        title = f"{header} (파트 {i//chunk_size + 1})\n\n"
-        send_telegram(title + body + (footer if i + chunk_size >= len(msg_list) else ""))
+
+    # 텔레그램 제한 4096 근처. 여유를 두고 분할
+    max_chars = 3500
+
+    chunks = []
+    cur = ""
+
+    def flush():
+        nonlocal cur
+        if cur.strip():
+            chunks.append(cur)
+        cur = ""
+
+    for line in msg_list:
+        line = str(line)
+
+        # 한 줄이 너무 길면 안전하게 잘라서 붙임(기존 문구는 그대로, 너무 길 때만 생략 꼬리)
+        if len(line) > max_chars:
+            line = line[:max_chars - 50] + "\n...(생략)"
+
+        candidate = (cur + ("\n" if cur else "") + line)
+
+        # header + title + body + footer 합이 max_chars를 넘지 않도록
+        # title 길이를 고려해서 대략적으로 안전 분할
+        title_probe = f"{header} (파트 1)\n\n"
+        tail_probe = footer
+        if len(title_probe) + len(candidate) + len(tail_probe) > max_chars:
+            flush()
+            cur = line
+        else:
+            cur = candidate
+
+    flush()
+
+    # 전송
+    for idx, body in enumerate(chunks, start=1):
+        title = f"{header} (파트 {idx})\n\n"
+        tail = footer if idx == len(chunks) else ""
+        send_telegram(title + body + tail)
         time.sleep(1)
+
 
 def _load_json(path, default):
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            # [운영 보강] 침묵 실패 방지 (메시지/코멘트에는 영향 없음)
+            print(f"[JSON LOAD FAIL] {path}: {repr(e)}")
     return default
 
+
 def _save_json(path, data):
+    """
+    [운영 보강]
+    - 원자적 저장(atomic): tmp 파일로 저장 후 교체
+    - 저장 실패 시 콘솔 로그
+    """
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[JSON SAVE FAIL] {path}: {repr(e)}")
+
 
 def load_pending_orders(): return _load_json(PENDING_ORDERS_PATH, {})
 def save_pending_orders(data): _save_json(PENDING_ORDERS_PATH, data)
@@ -124,6 +200,7 @@ def save_positions(data): _save_json(POSITIONS_STATE_PATH, data)
 def load_fills(): return _load_json(FILLS_PATH, [])
 def load_monthly_metrics(): return _load_json(MONTHLY_METRICS_PATH, {})
 def save_monthly_metrics(data): _save_json(MONTHLY_METRICS_PATH, data)
+
 
 def process_telegram_commands():
     if not BOT_TOKEN:
@@ -135,9 +212,21 @@ def process_telegram_commands():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
 
     try:
-        res = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10)
-        data = res.json()
+        res = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=15)
+
+        # [운영 보강] HTTP 실패 시 침묵 방지
+        if res.status_code != 200:
+            print(f"[TG UPDATES HTTP FAIL] {res.status_code}: {res.text[:200]}")
+            return
+
+        try:
+            data = res.json()
+        except Exception as e:
+            print(f"[TG UPDATES JSON FAIL] {repr(e)}")
+            return
+
         if not data.get("ok"):
+            print(f"[TG UPDATES NOT OK] {str(data)[:200]}")
             return
 
         fills = load_fills()
@@ -145,11 +234,14 @@ def process_telegram_commands():
         updates = data.get("result", [])
 
         for item in updates:
-            update_id = item["update_id"]
+            update_id = item.get("update_id")
+            if update_id is None:
+                continue
             new_offset = max(new_offset, update_id + 1)
 
             msg = item.get("message", {})
-            text = msg.get("text", "").strip()
+            text = msg.get("text", "")
+            text = text.strip() if isinstance(text, str) else ""
 
             if text.startswith("매수"):
                 parts = text.split()
@@ -169,7 +261,7 @@ def process_telegram_commands():
                         )
                     except:
                         pass
-            
+
             elif text.startswith("1차매도"):
                 parts = text.split()
                 if len(parts) >= 2:
@@ -191,7 +283,7 @@ def process_telegram_commands():
                             send_telegram(f"ℹ️ {ticker} 종목은 이미 1차 매도 완료 상태입니다.")
                     else:
                         send_telegram(f"⚠️ <b>[오류]</b> {ticker} 종목은 현재 보유 장부에 없습니다.")
-            
+
             elif text.startswith("매도"):
                 parts = text.split()
                 if len(parts) >= 2:
@@ -212,8 +304,10 @@ def process_telegram_commands():
             _save_json(TELEGRAM_OFFSET_PATH, {"offset": new_offset})
             _save_json(FILLS_PATH, fills)
 
-    except:
-        pass
+    except Exception as e:
+        # [운영 보강] 침묵 실패 방지
+        print(f"[TG UPDATES EXCEPTION] {repr(e)}")
+
 
 # =========================
 # [4. 위키피디아 스크래핑 및 매크로 경고 모듈]
@@ -354,7 +448,7 @@ def download_price_data_chunked(tickers, start_date, chunk_size=100, pause=1.2):
                 group_by='ticker', threads=True,
                 progress=False, auto_adjust=True
             )
-            
+
             if df is None or df.empty:
                 continue
 
@@ -362,7 +456,7 @@ def download_price_data_chunked(tickers, start_date, chunk_size=100, pause=1.2):
                 df = _ensure_multiindex(df, chunk[0])
             elif not isinstance(df.columns, pd.MultiIndex):
                 continue
-                
+
             all_parts.append(df)
         except:
             pass
@@ -497,16 +591,37 @@ def expire_pending_orders(pending: dict):
     return pending
 
 def apply_fills_to_positions(pending: dict, positions: dict):
+    """
+    [운영 보강]
+    - pending에 없는 체결(fill)은 삭제하지 않고 남겨서 유실 방지
+    - 반영된 fill만 제거
+    ※ 체결확정 메시지 문구는 기존 그대로 유지
+    """
     fills = load_fills()
     if not fills:
         return pending, positions
 
     new_fills_msgs = []
+    remaining_fills = []
+
     for fill in fills:
         ticker = str(fill.get("ticker", "")).strip().upper()
-        fill_price = float(fill.get("fill_price", 0))
+        try:
+            fill_price = float(fill.get("fill_price", 0))
+        except:
+            fill_price = 0.0
 
-        if not ticker or fill_price <= 0 or ticker in positions or ticker not in pending:
+        # 기본 유효성
+        if not ticker or fill_price <= 0:
+            continue
+
+        # 이미 포지션에 있으면 중복으로 보고 제거(기존과 동일하게 결과적으로 무시)
+        if ticker in positions:
+            continue
+
+        # pending에 없으면 반영 못함 -> 유실 방지 위해 남겨둠
+        if ticker not in pending:
+            remaining_fills.append(fill)
             continue
 
         od = pending[ticker]
@@ -515,6 +630,7 @@ def apply_fills_to_positions(pending: dict, positions: dict):
         atr_entry = float(od.get("atr_entry", 0))
 
         if qty < 1 or atr_entry <= 0:
+            remaining_fills.append(fill)
             continue
 
         one_r = opt_mult * atr_entry
@@ -539,7 +655,7 @@ def apply_fills_to_positions(pending: dict, positions: dict):
 
             "sl_alerted": False,
             "trail_alerted": False,
-            "tp2_alerted": False  
+            "tp2_alerted": False
         }
 
         pending.pop(ticker, None)
@@ -553,7 +669,8 @@ def apply_fills_to_positions(pending: dict, positions: dict):
     if new_fills_msgs:
         send_telegram_chunks(new_fills_msgs, f"<b>📌 {datetime.now().date()} 체결확정 반영</b>\n\n", "")
 
-    _save_json(FILLS_PATH, [])  
+    # [중요] 반영 못한 fill은 남김 (유실 방지)
+    _save_json(FILLS_PATH, remaining_fills)
     return pending, positions
 
 def evaluate_exits_and_alert(positions: dict, raw_data: pd.DataFrame):
@@ -857,7 +974,7 @@ def analyze():
 
     header = f"<b>📅 {datetime.now().date()} 퀀트 보고서 (PRO-MASTER 통합본)</b>\n\n"
     footer = f"{pos_summary}<b>[스캔 결과]</b> 유니버스:{len(tickers)}개 / 타점:{final_pass_count}개 / 슬롯잔여:{MAX_OPEN_POSITIONS - len(positions)}개"
-    
+
     send_telegram_chunks(msg_list, header, footer)
 
 if __name__ == "__main__":
